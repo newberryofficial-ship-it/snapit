@@ -30,6 +30,7 @@ const { Readable } = require('node:stream');
   }
 })();
 
+const yt = require('./youtube'); // after .env is read, because it reads its own settings when it loads
 const PORT = Number(process.env.PORT) || 8000;
 const KEY = (process.env.RAPIDAPI_KEY || '').trim();
 const KEY_READY = KEY !== '' && KEY !== 'your_key_here';
@@ -334,11 +335,27 @@ async function handleGrab(req, res) {
   if (!isAllowedLink(url)) {
     return json(res, 400, { error: 'Paste a valid HTTPS video link from a supported platform.' });
   }
+  let ytProblem = '';
+  let ytTried = false;
+  if (yt.isYouTubeLink(url) && await yt.isReady()) {
+    ytTried = true;
+    try {
+      return sendYoutubeOptions(res, await yt.grab(url));
+    } catch (e) {
+      console.error('YouTube grab failed:', e.userMessage || e.message);
+      if (e.final) return json(res, 422, { error: e.userMessage });
+      ytProblem = e.userMessage || '';
+      // otherwise carry on with the older method below
+    }
+  }
   let snapResult = null;
   if (isSnapHost(new URL(url).hostname)) {
     snapResult = await grabSnapchat(url).catch((e) => { console.error('Snapchat grab failed:', e.message); return null; });
     if (snapResult) return sendOptions(res, snapResult);
     if (!KEY_READY) return json(res, 502, { error: 'This Snapchat video could not be read. It may be private, removed or not public.' });
+  }
+  if (!KEY_READY && ytTried) {
+    return json(res, 502, { error: ytProblem || 'YouTube did not allow this video to be read right now. Try again in a few minutes.' });
   }
   if (!KEY_READY) {
     return json(res, 500, { error: 'The download service isn\'t connected yet. Put your RapidAPI key in the .env file (RAPIDAPI_KEY=...) and restart the server.' });
@@ -395,9 +412,25 @@ async function handleGrab(req, res) {
   sendOptions(res, { title: payload.title || data.title, medias });
 }
 
+const cleanTitle = (t) => String(t || 'video')
+  .replace(/[^\p{L}\p{N}\s_-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
+
+/* YouTube: one entry per quality. The file itself is built later, when Download is pressed. */
+function sendYoutubeOptions(res, g) {
+  const title = cleanTitle(g.title);
+  const options = g.offered.map((h) => {
+    const filename = `${title} (${h ? h + 'p' : 'best'}).mp4`;
+    const id = register({ yt: { link: g.link, clientArgs: g.clientArgs, res: h, audio: false }, filename, ext: 'mp4' });
+    return { label: h ? `Video · ${h}p` : 'Video · best quality', format: 'MP4', kind: 'video', filename, url: `/api/download/${id}` };
+  });
+  const aFile = `${title}.m4a`;
+  const aId = register({ yt: { link: g.link, clientArgs: g.clientArgs, res: 0, audio: true }, filename: aFile, ext: 'm4a' });
+  options.push({ label: 'Audio', format: 'M4A', kind: 'audio', filename: aFile, url: `/api/download/${aId}` });
+  json(res, 200, { options });
+}
+
 function sendOptions(res, src) {
-  const title = String(src.title || 'video')
-    .replace(/[^\p{L}\p{N}\s_-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'video';
+  const title = cleanTitle(src.title);
 
   const usable = src.medias.filter((m) => m && typeof m.url === 'string' && isSafeMediaUrl(m.url));
   const videos = usable.filter((m) => kindOf(m) === 'video');
@@ -532,9 +565,21 @@ async function openMedia(entry, signal) {
 
 /* GET /api/download/<id>?probe=1 — the page asks first, so a failure is shown inside the
    page instead of the browser being sent to an error screen. */
+async function handleYoutubeProbe(id, entry, res) {
+  const dest = path.join(DOWNLOADS_DIR, id);
+  const st = await fs.promises.stat(dest).catch(() => null);
+  if (st && st.isFile()) return json(res, 200, { ok: true });
+  let job = yt.getJob(id);
+  if (job && job.state === 'error') { yt.forget(id); return json(res, 502, { error: job.error }); }
+  if (job && job.state === 'done') { yt.forget(id); job = null; } // the finished file has since been cleared
+  if (!job) job = yt.start(id, entry, dest, DOWNLOADS_DIR);
+  return json(res, 202, { pending: true, pct: job.pct, label: job.label });
+}
+
 async function handleProbe(id, res) {
   const entry = files.get(id);
   if (!entry) return json(res, 410, { error: 'This download link has expired. Grab the video again.' });
+  if (entry.yt) return handleYoutubeProbe(id, entry, res);
   const cached = await fs.promises.stat(path.join(DOWNLOADS_DIR, id)).catch(() => null);
   if (cached && cached.isFile()) return json(res, 200, { ok: true });
 
@@ -571,6 +616,8 @@ async function handleDownload(id, res) {
     rs.pipe(res);
     return;
   }
+
+  if (entry.yt) return plain(res, 409, 'This file is not ready yet. Go back to SnapIT and press Download again.');
 
   const ac = new AbortController();
   res.on('close', () => { if (!res.writableFinished) ac.abort(); });
@@ -704,11 +751,16 @@ server.on('error', (e) => {
 });
 
 fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+yt.cleanup(DOWNLOADS_DIR);
 sweep(true); // copies from an earlier run can no longer be reached, so clear them
-setInterval(() => sweep(false), 5 * 60 * 1000).unref();
+setInterval(() => { sweep(false); yt.sweepJobs(); }, 5 * 60 * 1000).unref();
 
 server.listen(PORT, () => {
   console.log(`SnapIT running at http://localhost:${PORT}`);
+  yt.isReady().then((ok) => {
+    console.log(ok ? 'YouTube: yt-dlp found.' : 'YouTube: yt-dlp NOT found, so YouTube uses the older method.');
+    if (ok) yt.selfUpdate();
+  });
   console.log(KEY_READY
     ? 'Download service key loaded.'
     : 'WARNING: no RAPIDAPI_KEY set in .env — the Grab button will report the service as not connected.');

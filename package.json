@@ -2,13 +2,17 @@
   "name": "video-downloader",
   "version": "1.0.0",
   "private": true,
-  "description": "SnapIT — paste a video link, pick a file, save it.",
+  "description": "SnapIT \u2014 paste a video link, pick a file, save it.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "postinstall": "node scripts/setup-ytdlp.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
   }
 }
