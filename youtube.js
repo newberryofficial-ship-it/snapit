@@ -10,6 +10,7 @@
 
 const { spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const EXE_LOCAL = path.join(__dirname, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
@@ -30,6 +31,9 @@ const LADDER = [
   ['--extractor-args', 'youtube:player_client=tv'],
   ['--extractor-args', 'youtube:player_client=mweb,web_safari'],
 ];
+
+/* When signed-in cookies are used, the Android VR client can't be (it doesn't support cookies). */
+const ladder = () => (cookiesArgs().length ? LADDER.filter((a) => !a.join(' ').includes('android_vr')) : LADDER);
 
 function isYouTubeLink(link) {
   try {
@@ -81,9 +85,35 @@ async function ytdlp(args, opts) {
   return r;
 }
 
+/* YouTube often asks servers in data centres to "sign in to confirm you're not a bot".
+   Two optional answers, both set from Render's Environment page, never committed to git:
+   - a cookies.txt from a signed-in YouTube session (Render "Secret Files" shows up at
+     /etc/secrets/cookies.txt, or point YT_COOKIES_FILE at any path)
+   - YT_PROXY, the address of a proxy YouTube trusts more than this server */
+let cookieCopy;
+function cookiesArgs() {
+  if (cookieCopy === undefined) {
+    cookieCopy = null;
+    const src = process.env.YT_COOKIES_FILE || (fs.existsSync('/etc/secrets/cookies.txt') ? '/etc/secrets/cookies.txt' : '');
+    if (src && fs.existsSync(src)) {
+      try {
+        // yt-dlp wants to write the cookies back, and secret files are read-only, so use a copy.
+        const dst = path.join(os.tmpdir(), 'snapit-cookies.txt');
+        fs.copyFileSync(src, dst);
+        fs.chmodSync(dst, 0o600);
+        cookieCopy = dst;
+        console.log('YouTube: signed-in cookies file found, using it.');
+      } catch (e) { console.error('YouTube: could not use the cookies file:', e.message); }
+    }
+  }
+  return cookieCopy ? ['--cookies', cookieCopy] : [];
+}
+const proxyArgs = () => (process.env.YT_PROXY ? ['--proxy', process.env.YT_PROXY] : []);
+
 const baseArgs = () => [
   '--no-playlist', '--no-warnings', '--ignore-config', '--no-cache-dir',
   '--socket-timeout', '30', '--retries', '3',
+  ...cookiesArgs(), ...proxyArgs(),
   ...(FFMPEG ? ['--ffmpeg-location', FFMPEG] : []),
 ];
 
@@ -125,6 +155,13 @@ function problemError(problems) {
   return e;
 }
 
+let hinted = false;
+function hintOnce() {
+  if (hinted || cookiesArgs().length || process.env.YT_PROXY) return;
+  hinted = true;
+  console.error('YouTube is asking this server to sign in. Add a cookies.txt as a Render Secret File (or set YT_PROXY). See the README.');
+}
+
 const tail = (s) => String(s || '').split('\n').map((x) => x.trim()).filter(Boolean).slice(-3).join(' | ').slice(0, 400);
 const clientName = (extra) => (extra.length ? extra[1].replace('youtube:player_client=', '') : 'default');
 
@@ -135,7 +172,7 @@ async function grab(link) {
   const started = Date.now();
   const problems = [];
   let found = null;
-  for (const extra of LADDER) {
+  for (const extra of ladder()) {
     if (problems.length && Date.now() - started > 55000) break; // keep the whole request well under a minute and a half
     const r = await ytdlp([...baseArgs(), ...extra, '--dump-single-json', '--skip-download', link], { timeoutMs: 45000 });
     if (r.code === 0) {
@@ -143,6 +180,7 @@ async function grab(link) {
     }
     const c = classify(r.err);
     problems.push(c);
+    if (c.kind === 'blocked') hintOnce();
     console.error(`yt-dlp info [${clientName(extra)}] failed (${c.kind}): ${tail(r.err) || (r.timedOut ? 'timed out' : 'no output')}`);
     if (c.kind === 'final') break;
   }
@@ -199,7 +237,7 @@ async function runJob(id, entry, job, dest, dir) {
   job.pct = 1;
   try {
     fs.mkdirSync(work, { recursive: true });
-    const order = [spec.clientArgs || [], ...LADDER].filter((a, i, all) => all.findIndex((b) => JSON.stringify(b) === JSON.stringify(a)) === i);
+    const order = [spec.clientArgs || [], ...ladder()].filter((a, i, all) => all.findIndex((b) => JSON.stringify(b) === JSON.stringify(a)) === i);
     const formatArgs = spec.audio
       ? ['-f', 'ba[ext=m4a]/ba/b']
       : ['-f', 'bv*+ba/b', '-S', `res:${spec.res || MAX_HEIGHT},ext:mp4:m4a`, '--merge-output-format', 'mp4'];

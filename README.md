@@ -24,3 +24,15 @@ the button shows progress while it works.
 - yt-dlp checks for updates every time the server starts. If YouTube stops working, redeploy on Render
   (Manual Deploy) so the newest yt-dlp is fetched, then look at the Logs for lines that start with `yt-dlp`.
 - If yt-dlp isn't installed, YouTube falls back to the RapidAPI method.
+
+### If YouTube says "Sign in to confirm you're not a bot"
+
+YouTube often challenges servers in data centres such as Render's. Fix it with cookies from a signed-in session:
+
+1. Use a throwaway Google account (never your main one).
+2. Open a private/incognito window, sign in to YouTube, then open `https://www.youtube.com/robots.txt` in that same tab.
+3. Export the youtube.com cookies as `cookies.txt` with a cookie-export extension (for example "Get cookies.txt LOCALLY"), then close the private window.
+4. In Render: your service > Environment > Secret Files > add a file named `cookies.txt` with that content, then redeploy.
+
+Never commit cookies.txt to git. The cookies expire after a while; repeat the steps when the error comes back.
+A paid proxy (`YT_PROXY`) is the other option.
