@@ -1,9 +1,8 @@
-/* SnapIT — backend
-   - serves the page from ./public
+/* SnapIT — backend (API only; the page itself is hosted separately)
    - POST /api/grab           link in  -> list of download options out
    - GET  /api/download/<id>  streams the chosen file to the browser as a real
                               download, keeping a temporary copy in ./downloads
-   Run:  npm start   (or  node server.js)   then open http://localhost:8000
+   Run:  npm start   (or  node server.js)
    Only Node.js built-ins are used (Node 18+), so there is nothing to install. */
 'use strict';
 
@@ -169,20 +168,26 @@ function kindOf(m) {
    Snapchat's web page embeds its data as JSON (__NEXT_DATA__). The "contentUrl" /
    "mediaUrl" it lists for Spotlight is the *sharing* render (variant .27) which has the
    "Snapchat @user" watermark burned in. The same media id also exists as the clean
-   original render (variant .1034) with no overlay, so we rewrite to that and check it. */
+   original render (variant .1034) with no overlay, so we try that first and fall back
+   to the address the page gave us, so a video is never lost just because the clean copy
+   isn't available. */
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1';
+const BOT_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
 const isSnapHost = (h) => h === 'snapchat.com' || h.endsWith('.snapchat.com');
 const isSnapCdn = (h) => h.endsWith('.sc-cdn.net') || h.endsWith('.snapchat.com');
+const SNAP_MEDIA_RE = /^\/([A-Za-z0-9]+)\/([A-Za-z0-9_-]+)\.(\d+)\.([A-Za-z0-9]+)$/;
 
 function cleanCandidates(mediaUrl) {
   let u;
-  try { u = new URL(mediaUrl); } catch { return [mediaUrl]; }
-  const m = u.pathname.match(/^\/([a-z0-9]+)\/([A-Za-z0-9_-]+)\.(\d+)\.([A-Za-z0-9]+)$/);
-  if (!m || m[3] === '1034') return [mediaUrl];
+  try { u = new URL(mediaUrl); } catch { return []; }
+  const m = u.pathname.match(SNAP_MEDIA_RE);
+  if (!m || m[3] === '1034') return [];
   const [, dir, id, , tail] = m;
   const out = [];
-  const add = (host, d) => { const x = `https://${host}/${d}/${id}.1034.${tail}`; if (!out.includes(x)) out.push(x); };
+  const add = (host, d, query = '') => { const x = `https://${host}/${d}/${id}.1034.${tail}${query}`; if (!out.includes(x)) out.push(x); };
   add(u.hostname, dir);
+  add(u.hostname, dir, u.search); // some copies need the signed query string the page gave us
   add('cf-st.sc-cdn.net', 'd');
   add('bolt-gcdn.sc-cdn.net', dir);
   add('bolt-gcdn.sc-cdn.net', 'v');
@@ -190,53 +195,130 @@ function cleanCandidates(mediaUrl) {
   return out;
 }
 
+async function snapReachable(u) {
+  try {
+    const r = await fetch(u, { headers: { 'User-Agent': BROWSER_UA, Referer: 'https://www.snapchat.com/', Range: 'bytes=0-0' }, signal: AbortSignal.timeout(10000) });
+    if (r.body) r.body.cancel().catch(() => {});
+    return (r.status === 200 || r.status === 206) && /video|octet/.test(r.headers.get('content-type') || '');
+  } catch { return false; }
+}
+
+/* Checks every address at the same time but keeps the order of preference. */
 async function firstWorking(urls) {
-  for (const u of urls) {
-    try {
-      const r = await fetch(u, { headers: { 'User-Agent': BROWSER_UA, Range: 'bytes=0-0' }, signal: AbortSignal.timeout(10000) });
-      if (r.body) r.body.cancel().catch(() => {});
-      if ((r.status === 200 || r.status === 206) && /video|octet/.test(r.headers.get('content-type') || '')) return u;
-    } catch {}
+  const ok = await Promise.all(urls.map(snapReachable));
+  const i = ok.indexOf(true);
+  return i === -1 ? null : urls[i];
+}
+
+async function resolveSnapVideo(mediaUrl) {
+  let m = null;
+  try { m = new URL(mediaUrl).pathname.match(SNAP_MEDIA_RE); } catch {}
+  if (m && m[3] === '1034') return { url: mediaUrl, quality: 'Original · no watermark' };
+  const clean = await firstWorking(cleanCandidates(mediaUrl));
+  if (clean) return { url: clean, quality: 'Original · no watermark' };
+  return { url: mediaUrl, quality: 'Standard · may show watermark' };
+}
+
+const decodeEntities = (v) => v.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#0*39;|&#x27;/gi, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+const looksLikeVideoUrl = (v) => /^https?:\/\//i.test(v) && (/\.sc-cdn\.net\//i.test(v) || /\.(mp4|mov|m4v|webm)(\?|$)/i.test(v));
+
+function deepScanSnap(node, push, depth = 0) {
+  if (node == null || depth > 14) return;
+  if (typeof node === 'string') {
+    if (/^https?:\/\/[^\s?]*sc-cdn\.net\/[^\s?]*\.\d+\.mp4(\?|$)/i.test(node)) push(node);
+    return;
   }
-  return null;
+  if (Array.isArray(node)) { for (const x of node) deepScanSnap(x, push, depth + 1); return; }
+  if (typeof node === 'object') for (const k of Object.keys(node)) deepScanSnap(node[k], push, depth + 1);
+}
+
+/* Pulls every snap out of one copy of the Snapchat page. */
+function extractSnapMedia(html, link) {
+  const found = [];
+  const seen = new Set();
+  const push = (url, kind = 'video') => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+    let key = url;
+    try { const m = new URL(url).pathname.match(SNAP_MEDIA_RE); if (m) key = m[2]; } catch { return; }
+    if (seen.has(key)) return; // same media id = same snap, whichever render it is
+    seen.add(key);
+    found.push({ url, kind });
+  };
+
+  let title = '';
+  let root = null;
+  let pp = null;
+  const mt = html.match(/<script[^>]*\bid=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/);
+  if (mt) { try { root = JSON.parse(mt[1]); pp = (root && root.props && root.props.pageProps) || {}; } catch {} }
+
+  if (pp) {
+    // Spotlight page: the snap the link points at.
+    if (pp.videoMetadata) push(pp.videoMetadata.contentUrl);
+    // Public story / profile pages: every snap in the story.
+    const lists = [pp.story && pp.story.snapList, ...(pp.curatedHighlights || []).map((h) => h && h.snapList), ...(pp.spotlightHighlights || []).map((h) => h && h.snapList)];
+    if (!found.length) {
+      for (const list of lists) for (const s of list || []) {
+        const u = s && s.snapUrls && s.snapUrls.mediaUrl;
+        push(u, s && s.snapMediaType === 0 ? 'image' : 'video');
+      }
+    }
+    if (!found.length && pp.spotlightFeed) {
+      const st = (pp.spotlightFeed.spotlightStories || [])[0];
+      if (st) push(st.metadata && st.metadata.videoMetadata && st.metadata.videoMetadata.contentUrl);
+    }
+    title = String((pp.videoMetadata && (pp.videoMetadata.name || pp.videoMetadata.description)) || (pp.userProfile && pp.userProfile.publicProfileInfo && pp.userProfile.publicProfileInfo.username) || '');
+  }
+
+  // The page layout changes now and then: if the known places are empty, scan all of the page data.
+  if (!found.length && root) {
+    const deep = [];
+    const seenDeep = new Set();
+    deepScanSnap(root, (u) => { if (!seenDeep.has(u)) { seenDeep.add(u); deep.push(u); } });
+    const limit = /\/spotlight\//i.test(link) ? 1 : 10;
+    deep.slice(0, limit).forEach((u) => push(u));
+  }
+
+  // Last resort: the link-preview tags and structured data every public page carries.
+  if (!found.length) {
+    for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
+      const prop = (tag.match(/\b(?:property|name)=["']([^"']+)["']/i) || [])[1];
+      const content = (tag.match(/\bcontent=["']([^"']*)["']/i) || [])[1];
+      if (!prop || !content) continue;
+      if (/^(og:video(:secure_url|:url)?|twitter:player:stream)$/i.test(prop)) {
+        const v = decodeEntities(content);
+        if (looksLikeVideoUrl(v)) push(v);
+      } else if (!title && /^og:title$/i.test(prop)) title = decodeEntities(content);
+    }
+    for (const m of html.matchAll(/"contentUrl"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+      try { const v = JSON.parse('"' + m[1] + '"'); if (looksLikeVideoUrl(v)) push(v); } catch {}
+    }
+  }
+  return { found, title };
 }
 
 async function grabSnapchat(link) {
-  let r;
-  try {
-    r = await fetch(link, { headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'en-US,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
-  } catch { return null; }
-  if (!r.ok) return null;
-  const html = await r.text();
-  const mt = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (!mt) return null;
-  let pp;
-  try { pp = JSON.parse(mt[1]).props.pageProps || {}; } catch { return null; }
-
-  const found = [];
-  const push = (url, kind = 'video') => { if (typeof url === 'string' && url && !found.some((f) => f.url === url)) found.push({ url, kind }); };
-  // Spotlight page: the snap the link points at.
-  if (pp.videoMetadata) push(pp.videoMetadata.contentUrl);
-  // Public story / profile pages: every snap in the story.
-  const lists = [pp.story && pp.story.snapList, ...(pp.curatedHighlights || []).map((h) => h.snapList), ...(pp.spotlightHighlights || []).map((h) => h.snapList)];
-  if (!found.length) {
-    for (const list of lists) for (const s of list || []) {
-      const u = s && s.snapUrls && s.snapUrls.mediaUrl;
-      push(u, s.snapMediaType === 0 ? 'image' : 'video');
-    }
+  let best = null;
+  // Snapchat sometimes answers one kind of visitor with a block or a bare page, so try a few.
+  for (const ua of [BROWSER_UA, MOBILE_UA, BOT_UA]) {
+    let r;
+    try {
+      r = await fetch(link, { headers: { 'User-Agent': ua, Accept: 'text/html,application/xhtml+xml,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' }, signal: AbortSignal.timeout(20000) });
+    } catch { continue; }
+    if (r.status === 404 || r.status === 410) break;
+    if (!r.ok) { if (r.body) r.body.cancel().catch(() => {}); continue; }
+    let html;
+    try { html = await r.text(); } catch { continue; }
+    const got = extractSnapMedia(html, link);
+    if (got.found.length) { best = got; break; }
   }
-  if (!found.length && pp.spotlightFeed) {
-    const st = (pp.spotlightFeed.spotlightStories || [])[0];
-    if (st) push(st.metadata && st.metadata.videoMetadata && st.metadata.videoMetadata.contentUrl);
-  }
-  if (!found.length) return null;
+  if (!best) return null;
 
-  const title = String((pp.videoMetadata && (pp.videoMetadata.name || pp.videoMetadata.description)) || (pp.userProfile && pp.userProfile.publicProfileInfo && pp.userProfile.publicProfileInfo.username) || 'snapchat');
+  const title = best.title || 'snapchat';
   const medias = [];
-  for (const f of found.slice(0, 10)) {
+  for (const f of best.found.slice(0, 10)) {
     if (f.kind === 'image') { medias.push({ url: f.url, type: 'image', extension: 'jpg' }); continue; }
-    const clean = await firstWorking(cleanCandidates(f.url));
-    if (clean) medias.push({ url: clean, type: 'video', extension: 'mp4', quality: 'Original · no watermark' });
+    const v = await resolveSnapVideo(f.url);
+    medias.push({ url: v.url, type: 'video', extension: 'mp4', quality: v.quality });
   }
   return medias.length ? { title, medias } : null;
 }
@@ -348,19 +430,124 @@ function contentDisposition(name) {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
-/* Follow redirects by hand so every hop is checked, not just the first address. */
-async function fetchMedia(url, signal) {
-  for (let hop = 0; hop < 5; hop++) {
+/* ---------- fetching the media file ----------
+   Different hosts want different "faces". Each host gets a short list of header sets
+   (profiles); they are tried in order until one is answered with a real file, and the
+   one that worked is remembered for the real download. */
+const isYouTubeHost = (h) => h === 'googlevideo.com' || h.endsWith('.googlevideo.com') || h === 'youtube.com' || h.endsWith('.youtube.com');
+
+const APP_UAS = {
+  ANDROID: 'com.google.android.youtube/19.44.38 (Linux; U; Android 14; en_US) gzip',
+  ANDROID_VR: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+  IOS: 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+};
+
+function mediaProfiles(url) {
+  let host = '';
+  let client = '';
+  try { const u = new URL(url); host = u.hostname.toLowerCase(); client = (u.searchParams.get('c') || '').toUpperCase(); } catch {}
+
+  if (isSnapCdn(host)) {
+    return [{ name: 'snapchat', headers: { 'User-Agent': BROWSER_UA, Referer: 'https://www.snapchat.com/' } }];
+  }
+
+  if (isYouTubeHost(host)) {
+    const list = [];
+    const web = { Accept: '*/*', 'Accept-Language': 'en-US,en;q=0.9', Origin: 'https://www.youtube.com', Referer: 'https://www.youtube.com/' };
+    const app = (name) => ({ name: 'youtube-' + name.toLowerCase(), headers: { 'User-Agent': APP_UAS[name], Accept: '*/*', Range: 'bytes=0-' } });
+    // 1) the address was made for a particular YouTube app: look like that app
+    if (APP_UAS[client]) list.push(app(client));
+    // 2) look like a browser on youtube.com, asking for the whole file
+    list.push({ name: 'youtube-browser', headers: { ...web, 'User-Agent': BROWSER_UA, Range: 'bytes=0-' } });
+    // 3) the same without a Range header
+    list.push({ name: 'youtube-browser-plain', headers: { ...web, 'User-Agent': BROWSER_UA } });
+    // 4) the Android app, if not tried yet
+    if (client !== 'ANDROID') list.push(app('ANDROID'));
+    return list;
+  }
+
+  return [
+    { name: 'default', headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SnapIT)' } },
+    { name: 'browser', headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' } },
+  ];
+}
+
+/* Follow redirects by hand so every hop is checked, not just the first address.
+   The timer only covers waiting for the answer, not the download itself. */
+async function fetchFollow(startUrl, headers, outer) {
+  let url = startUrl;
+  for (let hop = 0; hop < 6; hop++) {
     if (!isSafeMediaUrl(url)) throw new Error('blocked media address');
-    const r = await fetch(url, { signal, redirect: 'manual', headers: isSnapCdn(new URL(url).hostname) ? { 'User-Agent': BROWSER_UA, Referer: 'https://www.snapchat.com/' } : { 'User-Agent': 'Mozilla/5.0 (compatible; SnapIT)' } });
+    const ac = new AbortController();
+    const onAbort = () => ac.abort();
+    if (outer.aborted) ac.abort(); else outer.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(() => ac.abort(), 60000);
+    let r;
+    try { r = await fetch(url, { signal: ac.signal, redirect: 'manual', headers }); }
+    finally { clearTimeout(timer); }
     if (r.status >= 300 && r.status < 400 && r.headers.get('location')) {
       url = new URL(r.headers.get('location'), url).href;
       if (r.body) r.body.cancel().catch(() => {});
       continue;
     }
-    return r;
+    return { res: r, url };
   }
   throw new Error('too many redirects');
+}
+
+function mediaFailMessage(status) {
+  if (status === 403) return 'The video host refused the download (403). Try another quality or format, or grab the link again.';
+  if (status === 404 || status === 410) return 'This file is no longer available from the video host. Grab the link again.';
+  if (status === 429) return 'The video host is limiting requests right now. Wait a minute and try again.';
+  if (status >= 500) return `The video host had a problem (${status}). Try again in a moment.`;
+  return 'The file could not be fetched. Try another option, or grab the link again.';
+}
+
+/* Returns an open, successful response for the file, or throws with a .status. */
+async function openMedia(entry, signal) {
+  const tries = [];
+  const seen = new Set();
+  const add = (url, profile) => { const k = url + '|' + profile.name; if (!seen.has(k)) { seen.add(k); tries.push({ url, profile }); } };
+  if (entry.winner) add(entry.winner.url, entry.winner.profile);
+  for (const p of mediaProfiles(entry.url)) add(entry.url, p);
+
+  let lastStatus = 0;
+  let host = '';
+  try { host = new URL(entry.url).hostname; } catch {}
+  for (const t of tries) {
+    if (signal.aborted) throw Object.assign(new Error('aborted'), { aborted: true });
+    try {
+      const { res, url } = await fetchFollow(t.url, t.profile.headers, signal);
+      if (res.ok && res.body) { entry.winner = { url, profile: t.profile }; return res; }
+      lastStatus = res.status;
+      console.error(`Media host ${host} answered ${res.status} (${res.headers.get('content-type') || 'no type'}) using "${t.profile.name}"`);
+      if (res.body) res.body.cancel().catch(() => {});
+    } catch (e) {
+      if (signal.aborted) throw Object.assign(new Error('aborted'), { aborted: true });
+      console.error(`Media host ${host} failed using "${t.profile.name}": ${e.message}`);
+    }
+  }
+  throw Object.assign(new Error('media unavailable'), { status: lastStatus });
+}
+
+/* GET /api/download/<id>?probe=1 — the page asks first, so a failure is shown inside the
+   page instead of the browser being sent to an error screen. */
+async function handleProbe(id, res) {
+  const entry = files.get(id);
+  if (!entry) return json(res, 410, { error: 'This download link has expired. Grab the video again.' });
+  const cached = await fs.promises.stat(path.join(DOWNLOADS_DIR, id)).catch(() => null);
+  if (cached && cached.isFile()) return json(res, 200, { ok: true });
+
+  const ac = new AbortController();
+  res.on('close', () => { if (!res.writableFinished) ac.abort(); });
+  try {
+    const up = await openMedia(entry, ac.signal);
+    if (up.body) up.body.cancel().catch(() => {});
+    return json(res, 200, { ok: true });
+  } catch (e) {
+    if (e.aborted) return;
+    return json(res, 502, { error: mediaFailMessage(e.status || 0) });
+  }
 }
 
 async function handleDownload(id, res) {
@@ -390,15 +577,10 @@ async function handleDownload(id, res) {
 
   let up;
   try {
-    up = await fetchMedia(entry.url, ac.signal);
+    up = await openMedia(entry, ac.signal);
   } catch (e) {
-    if (ac.signal.aborted) return;
-    console.error('Media fetch failed:', e.message);
-    return plain(res, 502, 'The file could not be fetched. Go back to SnapIT and grab the video again.');
-  }
-  if (!up.ok || !up.body) {
-    console.error(`Media host answered ${up.status}`);
-    return plain(res, 502, 'The file could not be fetched. Go back to SnapIT and grab the video again.');
+    if (e.aborted || ac.signal.aborted) return;
+    return plain(res, 502, mediaFailMessage(e.status || 0));
   }
 
   const headers = {
@@ -487,7 +669,8 @@ async function route(req, res) {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
   let pathName;
-  try { pathName = new URL(req.url, 'http://localhost').pathname; }
+  let query;
+  try { const u = new URL(req.url, 'http://localhost'); pathName = u.pathname; query = u.searchParams; }
   catch { return plain(res, 400, 'Bad request'); }
 
   if (pathName === '/api/grab') {
@@ -498,6 +681,7 @@ async function route(req, res) {
   const dl = pathName.match(/^\/api\/download\/([a-f0-9]{24})$/);
   if (dl) {
     if (req.method !== 'GET') return plain(res, 405, 'Use GET.');
+    if (query.get('probe') === '1') return handleProbe(dl[1], res);
     return handleDownload(dl[1], res);
   }
 
