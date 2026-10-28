@@ -1,0 +1,11 @@
+name = "snapit"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[vars]
+BACKEND_URL = "https://snapit-backend.onrender.com"

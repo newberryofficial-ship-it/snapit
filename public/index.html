@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SnapIT — Video downloads, made simple</title>
+  <meta name="description" content="Paste a YouTube, Pinterest, Snapchat, TikTok, X or Instagram link and grab the video or audio.">
+  <meta property="og:title" content="SnapIT — Video downloads, made simple">
+  <meta property="og:description" content="A little link. A moment worth keeping. Video and audio downloads with SnapIT.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="snap-page">
+  <div class="flow-scene" aria-hidden="true">
+    <img src="flow-background.jpg" width="1920" height="1088" alt="">
+    <div class="flow-tint"></div><div class="star-field"><i class="star star-0"></i><i class="star star-1"></i><i class="star star-2"></i><i class="star star-3"></i><i class="star star-4"></i><i class="star star-5"></i><i class="star star-6"></i><i class="star star-7"></i><i class="star star-8"></i><i class="star star-9"></i><i class="star star-10"></i><i class="star star-11"></i><i class="star star-12"></i><i class="star star-13"></i><i class="star star-14"></i><i class="star star-15"></i><i class="star star-16"></i><i class="star star-17"></i><i class="star star-18"></i><i class="star star-19"></i><i class="star star-20"></i><i class="star star-21"></i><i class="star star-22"></i><i class="star star-23"></i><i class="star star-24"></i><i class="star star-25"></i><i class="star star-26"></i><i class="star star-27"></i><i class="star star-28"></i><i class="star star-29"></i><i class="star star-30"></i><i class="star star-31"></i><i class="star star-32"></i><i class="star star-33"></i><i class="star star-34"></i><i class="star star-35"></i><i class="star star-36"></i><i class="star star-37"></i><i class="star star-38"></i><i class="star star-39"></i><i class="star star-40"></i><i class="star star-41"></i><i class="star star-42"></i><i class="star star-43"></i><i class="star star-44"></i><i class="star star-45"></i><i class="star star-46"></i><i class="star star-47"></i></div>
+  </div>
+
+  <header class="site-header">
+    <a href="./" class="wordmark" aria-label="SnapIT home">
+      <span class="brand-symbol" id="brand-symbol"></span>SnapIT<span class="brand-dot">.</span>
+    </a>
+    <div class="header-right">
+      <button type="button" class="theme-switch" id="theme-switch" role="switch" aria-checked="false" aria-label="Dark mode" title="Switch to dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l2 2m10 10 2 2M5 19l2-2M17 7l2-2"/></svg><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 15A9 9 0 0 1 9 4a9 9 0 1 0 11 11Z"/></svg><span class="switch-thumb"></span></button>
+    </div>
+  </header>
+
+  <main class="main-content">
+    <div class="intro">
+      <h1>SnapIT<span class="title-dot">.</span></h1>
+    </div>
+
+    <section class="download-area" aria-label="Video downloader">
+      <form class="link-box" id="link-form" autocomplete="off">
+        <div class="input-platform" id="input-platform"></div>
+        <input id="link-input" aria-label="Video link" placeholder="Paste a YouTube video link here…" spellcheck="false" autocapitalize="off" type="text">
+        <button type="button" class="icon-button" id="clear-btn" aria-label="Clear list" title="Clear list"></button>
+        <button type="submit" class="grab-button" id="grab-btn" aria-label="Grab video">
+          <span class="grab-icon" id="grab-icon"></span><span class="grab-text">Grab video</span>
+        </button>
+      </form>
+
+      <div class="platform-picker" id="platform-picker" role="group" aria-label="Choose platform"></div>
+
+      <div aria-live="polite" id="status"></div>
+
+      <div class="trust-line">
+        <span><i class="t-icon" id="trust-1"></i> Just your link</span>
+        <span class="trust-separator"></span>
+        <span><i class="t-icon" id="trust-2"></i> Less waiting, more watching</span>
+        <span class="trust-separator"></span>
+        <span><i class="t-icon" id="trust-3"></i> Video + audio</span>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <span>© 2026 SnapIT</span>
+    <p>Made for the moments you love.</p>
+  </footer>
+
+  <div class="modal-backdrop" id="modal" hidden>
+    <section class="info-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <button type="button" class="icon-button modal-close" id="modal-close" aria-label="Close dialog"></button>
+      <i class="modal-spark" id="modal-spark"></i>
+      <h2 id="modal-title">A moment worth keeping.</h2>
+      <p>SnapIT brings your favorite video links together in one place. Save the moments you own or have permission to download.</p>
+      <p>Available formats, resolution, and watermark-free versions depend on the source and platform. Downloads require a connected processing service.</p>
+      <button type="button" class="grab-button" id="modal-done">Got it <span class="btn-icon" id="modal-check"></span></button>
+    </section>
+  </div>
+</div>
+  <script src="script.js?v=5" defer></script>
+</body>
+</html>
