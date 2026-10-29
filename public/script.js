@@ -155,11 +155,54 @@ async function startDownload(btn, note, o) {
   }
 }
 
-function showResults(options) {
+function fmtDuration(sec) {
+  if (typeof sec !== 'number' || !isFinite(sec) || sec <= 0) return '';
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+}
+
+/* Thumbnail + title card shown above the download buttons. */
+function previewCard(info) {
+  const card = document.createElement('div');
+  card.className = 'preview-card';
+  const media = document.createElement('div');
+  media.className = 'preview-thumb';
+  const thumb = typeof info.thumbnail === 'string' && info.thumbnail.startsWith('https://') ? info.thumbnail : '';
+  if (thumb) {
+    const img = document.createElement('img');
+    img.alt = '';
+    img.referrerPolicy = 'no-referrer'; // several video sites block images shown on other websites
+    img.src = thumb;
+    img.addEventListener('error', () => { img.remove(); media.classList.add('is-empty'); });
+    media.appendChild(img);
+  } else media.classList.add('is-empty');
+  const fallback = document.createElement('span');
+  fallback.className = 'preview-fallback';
+  fallback.innerHTML = ICONS.download;
+  media.appendChild(fallback);
+  const d = fmtDuration(info.duration);
+  if (d) { const t = document.createElement('span'); t.className = 'preview-time'; t.textContent = d; media.appendChild(t); }
+  const text = document.createElement('div');
+  text.className = 'preview-text';
+  const title = document.createElement('strong');
+  title.textContent = info.title || 'Your video';
+  const plat = document.createElement('small');
+  plat.textContent = info.platform || '';
+  text.appendChild(title);
+  text.appendChild(plat);
+  card.appendChild(media);
+  card.appendChild(text);
+  return card;
+}
+
+function showResults(options, info) {
+  info = info || {};
   clearStatus(); // remove the "Finding your moment…" loader before showing the list
   const wrap = document.createElement('div');
   wrap.className = 'results';
   wrap.innerHTML = `<div class="results-heading"><span>${ICONS.check} Your moment is ready</span><small>Quality depends on the original video</small></div>`;
+  wrap.appendChild(previewCard(info));
   options.forEach((o, i) => {
     const row = document.createElement('div');
     row.className = 'download-row';
@@ -249,7 +292,7 @@ async function submit(event) {
     catch { data = { error: 'The SnapIT server did not respond properly. Try again in a moment.' }; }
     setLoading(false);
     if (data.error) showError(data.error);
-    if (Array.isArray(data.options) && data.options.length) showResults(data.options);
+    if (Array.isArray(data.options) && data.options.length) showResults(data.options, data);
     else if (!data.error) showError('Nothing came back for that link. Try another one.');
   } catch {
     setLoading(false);

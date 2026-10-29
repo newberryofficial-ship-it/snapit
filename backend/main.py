@@ -174,8 +174,8 @@ def resolve_short(url: str) -> str:
     """Follow t.co / pin.it by hand so the real destination is checked against the allowed sites."""
     for _ in range(5):
         host = (urlparse(url).hostname or "").lower()
-        if host not in SHORT_HOSTS:
-            return url
+        if host not in SHORT_HOSTS and "/url_shortener/" not in urlparse(url).path:
+            return clean_pin(url)
         r = requests.get(url, allow_redirects=False, stream=True, timeout=15,
                          headers={"User-Agent": "Mozilla/5.0 (compatible; SnapIT)"})
         try:
@@ -191,9 +191,15 @@ def resolve_short(url: str) -> str:
         url = urljoin(url, loc)
         if not valid_url(url):
             raise ValueError("That short link doesn't lead to a supported site.")
-    if (urlparse(url).hostname or "").lower() in SHORT_HOSTS:
+    if (urlparse(url).hostname or "").lower() in SHORT_HOSTS or "/url_shortener/" in urlparse(url).path:
         raise ValueError("That short link could not be opened.")
-    return url
+    return clean_pin(url)
+
+
+def clean_pin(url: str) -> str:
+    """Pinterest share links end in /sent/?invite_code=...; yt-dlp only understands /pin/<id>/."""
+    m = re.search(r"pinterest\.[a-z.]+/pin/(?:[^/?#]*--)?(\d+)", url)
+    return f"https://www.pinterest.com/pin/{m.group(1)}/" if m else url
 
 
 # ----------------------------------------------------------------------------------------------
@@ -320,7 +326,13 @@ def has_media(entry: dict | None) -> bool:
 
 
 def lookup(url: str) -> dict:
-    """Read the video's details without downloading it (same clients, same order as the download)."""
+    """Read the video's details without downloading it (same clients, same order as the download).
+
+    The preview must never be stricter than the download itself: YouTube often hides the format
+    list from a look-up (bot checks, "page needs to be reloaded", PO tokens) while the real download
+    still works with another client. So a look-up that finds the video but no formats, or that fails
+    outright, falls back to a plain "best quality" option - exactly what Toolora's /download does.
+    """
     base = {
         "noplaylist": True,
         "socket_timeout": 20,
@@ -331,21 +343,28 @@ def lookup(url: str) -> dict:
         "ignore_no_formats_error": True,
         "remote_components": ["ejs:github"],
     }
+    partial = None
     last = None
     for extra in info_attempts(url):
         try:
             with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
                 info = ydl.extract_info(url, download=False)
         except yt_dlp.utils.DownloadError as e:
-            if is_youtube(url) and any(x in str(e).lower() for x in YT_RETRY):
-                last = e
-                continue
-            raise
+            last = e
+            if is_youtube(url):
+                continue  # any YouTube error: try the next client, like the download does
+            break
         entry = first_entry(info) if info else None
         if has_media(entry):
             return entry
-        last = RuntimeError("No downloadable video was found for that link.")
-    raise last or RuntimeError("No downloadable video was found for that link.")
+        if entry and partial is None:
+            partial = entry  # title/thumbnail without formats: still usable for the preview
+    if partial is not None:
+        return partial
+    if is_youtube(url) or last is None or "unsupported url" not in str(last).lower():
+        # Let the download step (Toolora's proven logic) decide; it reports a real error if it fails.
+        return {"title": None, "formats": [], "fallback": True}
+    raise last
 
 
 # ----------------------------------------------------------------------------------------------
@@ -574,6 +593,7 @@ def extract_snap_media(html: str, link: str) -> tuple[list[tuple[str, str]], str
 
 def grab_snapchat(link: str) -> dict | None:
     best = None
+    snap_thumb = None
     # Snapchat sometimes answers one kind of visitor with a block or a bare page, so try a few.
     for ua in (BROWSER_UA, MOBILE_UA, BOT_UA):
         try:
@@ -592,12 +612,15 @@ def grab_snapchat(link: str) -> dict | None:
             r.close()
         found, title = extract_snap_media(html, link)
         if found:
+            m = re.search(r"""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)""", html, re.I)
+            snap_thumb = m.group(1).replace("&amp;", "&") if m else None
             best = (found, title)
             break
     if not best:
         return None
 
     found, title = best
+    thumb = snap_thumb if snap_thumb and snap_thumb.startswith("https://") else None
     medias = []
     for url, kind in found[:10]:
         if kind == "image":
@@ -606,7 +629,7 @@ def grab_snapchat(link: str) -> dict | None:
         url, quality = resolve_snap_video(url)
         medias.append({"url": url, "kind": "video", "ext": "mp4", "quality": quality})
     medias = [m for m in medias if is_snap_cdn((urlparse(m["url"]).hostname or "").lower())]
-    return {"title": title or "snapchat", "medias": medias} if medias else None
+    return {"title": title or "snapchat", "medias": medias, "thumbnail": thumb} if medias else None
 
 
 def media_fail_message(status: int) -> str:
@@ -858,7 +881,7 @@ async def grab(req: Req, request: Request):
         if is_snap_host((urlparse(url).hostname or "").lower()):
             snap = await asyncio.to_thread(grab_snapchat, url)
             if snap:
-                return {"title": clean_title(snap["title"]), "platform": platform, "thumbnail": None, "duration": None,
+                return {"title": clean_title(snap["title"]), "platform": platform, "thumbnail": snap.get("thumbnail"), "duration": None,
                         "options": options_from_snap(url, snap)}
         try:
             entry = await asyncio.to_thread(lookup, url)
