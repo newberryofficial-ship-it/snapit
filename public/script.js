@@ -229,18 +229,9 @@ async function playPreview({ card, media, play, note, thumb, src }) {
   video.preload = 'auto';
   video.setAttribute('playsinline', '');
   if (thumb) video.poster = thumb;
-  video.addEventListener('loadedmetadata', () => {   // fit the frame to the video (portrait Snaps stay tall and narrow)
-    if (video.videoWidth && video.videoHeight) {
-      const portrait = video.videoHeight > video.videoWidth;
-      media.style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
-      media.style.width = portrait ? 'min(100%, 300px)' : '100%';
-    }
-  }, { once: true });
   video.addEventListener('error', () => {
     video.remove();
-    media.classList.remove('is-playing', 'is-busy');
-    media.style.aspectRatio = media.style.width = '';
-    card.classList.remove('is-playing');
+    media.classList.remove('is-playing');
     play.hidden = false;
     reset('This video can\u2019t be played in your browser, but the download buttons below still work.');
   }, { once: true });
@@ -248,8 +239,8 @@ async function playPreview({ card, media, play, note, thumb, src }) {
   media.appendChild(video);
   media.classList.remove('is-busy');
   media.classList.add('is-playing');
-  card.classList.add('is-playing');
   play.hidden = true;
+  play.innerHTML = ICONS.play; // no spinner left behind
   video.play().catch(() => {}); // if the browser wants a tap first, the player's own play button is right there
 }
 
