@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1e1b4b">
+  <title>SnapIT — You're offline</title>
+  <style>
+    html,body{height:100%;margin:0}
+    body{display:grid;place-items:center;padding:24px;box-sizing:border-box;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f1f2f9;color:#1e1b4b;text-align:center}
+    .card{max-width:360px}
+    .logo{width:64px;height:64px;border-radius:18px;background:#1e1b4b;display:grid;place-items:center;margin:0 auto 20px}
+    .logo svg{width:32px;height:32px}
+    h1{font-size:22px;margin:0 0 8px}
+    p{margin:0 0 20px;line-height:1.5;opacity:.75}
+    button{font:inherit;font-weight:600;border:0;border-radius:12px;padding:12px 22px;background:#1e1b4b;color:#fff;cursor:pointer}
+    @media (prefers-color-scheme:dark){body{background:#0f0e1f;color:#ecebff}.logo,button{background:#2a2670}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V3"/><path d="m6 11 6 6 6-6"/><path d="M19 21H5"/></svg></div>
+    <h1>You're offline</h1>
+    <p>SnapIT needs an internet connection to read and download videos. Reconnect and try again.</p>
+    <button onclick="location.reload()">Try again</button>
+  </div>
+</body>
+</html>

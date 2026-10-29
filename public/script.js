@@ -455,3 +455,30 @@ themeSwitch.addEventListener('click', async () => {
  }
  themeSwitch.disabled = false;
 });
+
+
+/* ============ PWA: service worker, install button, share target ============ */
+if ('serviceWorker' in navigator) {
+ window.addEventListener('load', () => { navigator.serviceWorker.register('/sw.js').catch(() => {}); });
+}
+
+/* "Install app" button (Chrome, Edge, Android). iOS has no install prompt: use Share > Add to Home Screen. */
+const installBtn = document.getElementById('install-btn');
+let installEvent = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvent = e; installBtn.hidden = false; });
+installBtn.addEventListener('click', async () => {
+ if (!installEvent) return;
+ installEvent.prompt();
+ try { await installEvent.userChoice; } catch {}
+ installEvent = null; installBtn.hidden = true;
+});
+window.addEventListener('appinstalled', () => { installEvent = null; installBtn.hidden = true; });
+
+/* Share target: sharing a link to SnapIT from another app opens it with the link already pasted in. */
+(() => {
+ const q = new URLSearchParams(location.search);
+ const shared = [q.get('url'), q.get('text'), q.get('title')].map(v => (v || '').match(/https?:\/\/\S+/)).find(Boolean);
+ if (!shared) return;
+ updateUrl(shared[0]);
+ history.replaceState(null, '', location.pathname);
+})();

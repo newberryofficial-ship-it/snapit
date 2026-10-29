@@ -347,3 +347,9 @@ a { color: inherit; }
 .star-45 { left: 72%; top: 88%; animation-delay: -3.0s; }
 .star-46 { left: 9%; top: 16%; animation-delay: -4.1s; }
 .star-47 { left: 46%; top: 39%; animation-delay: -5.2s; }
+
+/* PWA: install button */
+.install-btn { padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--foreground); background: var(--glass); border: 1px solid var(--border); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); transition: background .2s, transform .2s; }
+.install-btn:hover { background: var(--glass-highlight); transform: translateY(-1px); }
+.install-btn[hidden] { display: none; }
+.header-right { display: flex; align-items: center; gap: 10px; }

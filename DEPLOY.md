@@ -81,3 +81,11 @@ Open http://localhost:8000 . The backend serves `../public` when it sits next to
 - Keep `RAPIDAPI_KEY` only in Render's environment settings. Never put it in `script.js`, `wrangler.toml` or a committed file. If an old `.env` with a key was ever shared or committed, revoke that key in the RapidAPI dashboard and use a new one.
 - Every YouTube grab costs one RapidAPI request (repeat grabs of the same link within 10 minutes are served from the cache and cost nothing). Watch your plan's monthly quota.
 - Image-only posts (for example a Pinterest photo pin) are not offered, because yt-dlp handles video. Snapchat images still work.
+
+## PWA (installable app)
+SnapIT is now an installable Progressive Web App. New files in `public/`: `manifest.webmanifest`, `sw.js` (service worker), `offline.html`, `_headers`, and `icons/` (192/512 px, maskable, Apple touch icon). `index.html`, `style.css` and `script.js` were extended (manifest link, install button, service-worker registration, share target).
+- **Installing:** Chrome/Edge/Android show an "Install app" button in the header; on iPhone use Share > Add to Home Screen.
+- **Offline:** the page shell is cached so the app opens instantly; with no connection it shows a friendly offline message. Grabbing and downloading always need the internet, and `/api/*` is never cached by the service worker.
+- **Share target:** on Android/desktop Chrome, sharing a link to SnapIT pre-fills the link box.
+- **Updating:** when you change `style.css`, `script.js` or other cached files, bump `VERSION` in `sw.js` (and the `?v=7` in `index.html` + `SHELL_FILES` if you change those) so installed copies refresh.
+- Needs HTTPS (the Cloudflare Worker domain already is). `_headers` makes `sw.js` revalidate on every load.
