@@ -7,7 +7,8 @@
 
 How a download works (same logic as Toolora's /download):
   * the link must belong to a supported site (this also blocks SSRF to internal hosts)
-  * yt-dlp fetches the video with the same format ladder and the same YouTube client fallbacks
+  * YouTube is handled ONLY through RapidAPI (set RAPIDAPI_KEY); every other site goes through yt-dlp
+  * yt-dlp fetches the video with a format ladder, then checks the file really has sound (and repairs it if not)
   * "video" options give an MP4 that fits the size cap, "audio" options give the sound only as an MP3
   * Snapchat links are read straight from Snapchat's public page (no watermark when the clean copy exists)
 SnapIT adds one step on top of Toolora: /api/grab looks the link up first so the page can show a preview
@@ -24,14 +25,22 @@ Env vars (all optional):
   FILE_TTL_MINUTES      how long a prepared file stays available before it is deleted (default 30)
   CACHE_MAX_MB          total size of prepared files kept on disk (default 1024)
   DOWNLOAD_DIR          where prepared files are kept (default: <system temp>/snapit_downloads)
+  RAPIDAPI_KEY          your RapidAPI key - required for YouTube links only
+  RAPIDAPI_YT_HOST      the RapidAPI host to call (default: youtube-media-downloader.p.rapidapi.com)
+  RAPIDAPI_YT_PATH      the endpoint path on that host (default: /v2/video/details)
+  GRAB_CACHE_SECONDS    how long a look-up is remembered so repeat grabs are instant (default 600)
+  DOWNLOAD_CONNECTIONS  parallel connections used for YouTube files (default 4)
+  FRAGMENT_THREADS      parallel fragment downloads inside yt-dlp (default 4)
+  KEEP_ALIVE_SECONDS    the service pings its own public address this often so Render never sleeps (default 120; 0 = off)
+  KEEP_ALIVE_URL        address to ping (default: RENDER_EXTERNAL_URL, which Render sets automatically)
 """
-import asyncio, hmac, ipaddress, json, os, re, secrets, shutil, tempfile, time
+import asyncio, copy, hmac, ipaddress, json, os, re, secrets, shutil, subprocess, tempfile, threading, time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from itertools import islice
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 import yt_dlp
@@ -52,6 +61,14 @@ CACHE_MAX = int(os.getenv("CACHE_MAX_MB", "1024")) * 1024 * 1024
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR") or os.path.join(tempfile.gettempdir(), "snapit_downloads")
 slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT", "3")))
 grab_slots = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_GRABS", "6")))
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "").strip()
+RAPIDAPI_HOST = os.getenv("RAPIDAPI_YT_HOST", "youtube-media-downloader.p.rapidapi.com").strip()
+RAPIDAPI_PATH = os.getenv("RAPIDAPI_YT_PATH", "/v2/video/details").strip()
+INFO_TTL = int(os.getenv("GRAB_CACHE_SECONDS", "600"))
+DL_WORKERS = max(1, int(os.getenv("DOWNLOAD_CONNECTIONS", "4")))
+FRAGMENT_THREADS = max(1, int(os.getenv("FRAGMENT_THREADS", "4")))
+KEEP_ALIVE_SECONDS = int(os.getenv("KEEP_ALIVE_SECONDS", "120"))
+KEEP_ALIVE_URL = (os.getenv("KEEP_ALIVE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
 # Only these sites (and their subdomains) are accepted; this also blocks SSRF to internal hosts.
 ALLOWED_HOSTS = ("youtube.com", "youtu.be", "pinterest.com", "pin.it", "snapchat.com",
@@ -75,11 +92,13 @@ async def lifespan(_: FastAPI):
     for name in os.listdir(DOWNLOAD_DIR):  # files from an earlier run can no longer be reached, so clear them
         if ID_RE.match(name):
             shutil.rmtree(os.path.join(DOWNLOAD_DIR, name), ignore_errors=True)
-    sweeper_task = asyncio.create_task(sweeper())
+    tasks = [asyncio.create_task(sweeper()), asyncio.create_task(keep_alive())]
+    asyncio.create_task(asyncio.to_thread(warm_up))  # load yt-dlp's extractors now, not on the first visitor's request
     try:
         yield
     finally:
-        sweeper_task.cancel()
+        for t in tasks:
+            t.cancel()
 
 
 app = FastAPI(title="SnapIT backend", lifespan=lifespan)
@@ -203,13 +222,62 @@ def clean_pin(url: str) -> str:
 
 
 # ----------------------------------------------------------------------------------------------
-# yt-dlp download logic (Toolora)
+# Small in-memory cache: a link that was looked up a moment ago is answered instantly
+# ----------------------------------------------------------------------------------------------
+_cache: dict[str, tuple[float, object]] = {}
+_cache_lock = threading.Lock()
+
+
+def cache_get(key: str):
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < INFO_TTL:
+            return hit[1]
+        _cache.pop(key, None)
+    return None
+
+
+def cache_put(key: str, value) -> None:
+    with _cache_lock:
+        _cache[key] = (time.time(), value)
+        if len(_cache) > 300:  # oldest first
+            for k in sorted(_cache, key=lambda k: _cache[k][0])[:50]:
+                _cache.pop(k, None)
+
+
+def warm_up() -> None:
+    """Import every yt-dlp extractor once at start-up (takes ~1s) so the first real request isn't slowed down."""
+    try:
+        yt_dlp.extractor.gen_extractor_classes()
+    except Exception as e:
+        print("Warm-up skipped:", repr(e))
+
+
+def ping_self() -> None:
+    try:
+        requests.get(KEEP_ALIVE_URL + "/health", timeout=20, headers={"User-Agent": "SnapIT-keepalive"}).close()
+    except requests.RequestException as e:
+        print("Keep-alive ping failed:", repr(e))
+
+
+async def keep_alive() -> None:
+    """Render's free plan puts a service to sleep after ~15 minutes without traffic. Calling our own public
+    address every couple of minutes counts as traffic. (The Cloudflare worker's cron also pings /health, which
+    wakes the service even if it ever did fall asleep.)"""
+    if not KEEP_ALIVE_URL or KEEP_ALIVE_SECONDS <= 0:
+        return
+    while True:
+        await asyncio.sleep(KEEP_ALIVE_SECONDS)
+        await asyncio.to_thread(ping_self)
+
+
+# ----------------------------------------------------------------------------------------------
+# yt-dlp download logic (every site except YouTube)
 # ----------------------------------------------------------------------------------------------
 SORT = ["res", "ext:mp4:m4a"]  # best resolution, preferring MP4/M4A so the result plays on phones
 FRAGMENT = re.compile(r"\.f[\w-]+\.[A-Za-z0-9]+$")  # intermediate streams such as "name.f137.mp4"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-YT_CLIENTS = ["tv", "android_vr", "web_embedded", "web_safari", "web"]
-YT_RETRY = ("player response", "sign in to confirm", "requested format", "unable to extract", "http error 403", "forbidden")
+SAFE_AUDIO = {"aac", "mp3"}  # audio codecs every phone/player can play inside an MP4
 
 
 def clear_folder(folder: str) -> None:
@@ -229,36 +297,32 @@ def is_youtube(url: str) -> bool:
     return host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be")
 
 
-def attempts_for(mode: str, url: str, height: int | None = None) -> list[dict]:
+def attempts_for(mode: str, height: int | None = None) -> list[dict]:
     if mode == "audio":
-        formats = [{
+        return [{
             "format": "bestaudio/best",
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
         }]
-    elif height is None:
-        formats = [{"format": "bv*+ba/b", "format_sort": SORT},
-                   {"format": "bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
-                   {"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
-                   {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
-                   {"format": "best"}]
-    else:  # the quality the visitor picked, then the same ladder below it
-        caps = [height] + [h for h in (1080, 720, 480) if h < height]
-        formats = [{"format": f"bv*[height<={h}]+ba/b[height<={h}]", "format_sort": SORT} for h in caps]
-        formats.append({"format": "best"})
-    if not is_youtube(url):
-        return formats
+    if height is None:
+        return [{"format": "bv*+ba/b", "format_sort": SORT},
+                {"format": "bv*[height<=1080]+ba/b[height<=1080]", "format_sort": SORT},
+                {"format": "bv*[height<=720]+ba/b[height<=720]", "format_sort": SORT},
+                {"format": "bv*[height<=480]+ba/b[height<=480]", "format_sort": SORT},
+                {"format": "best"}]
+    # the quality the visitor picked, then the same ladder below it
+    caps = [height] + [h for h in (1080, 720, 480) if h < height]
+    formats = [{"format": f"bv*[height<={h}]+ba/b[height<={h}]", "format_sort": SORT} for h in caps]
+    formats.append({"format": "best"})
+    return formats
 
-    # YouTube's extractor changes frequently. Try current clients in a deliberate order.
-    out = []
-    for client in YT_CLIENTS:
-        for item in formats[:4 if mode == "video" else 1]:
-            x = dict(item)
-            x["extractor_args"] = {"youtube": {"player_client": [client]}}
-            x["remote_components"] = ["ejs:github"]
-            out.append(x)
-    # Final generic attempts let yt-dlp choose a newly supported client.
-    out.extend({**x, "remote_components": ["ejs:github"]} for x in formats)
-    return out
+
+def sound_attempts(height: int | None) -> list[dict]:
+    """Used only when the first download came out silent: ask explicitly for a separate video + audio pair
+    (Instagram and a few others offer video-only streams that look like complete files), then for a file
+    that is known to carry both."""
+    h = f"[height<={height}]" if height else ""
+    return [{"format": f"bv*{h}[acodec=none]+ba/bv*{h}+ba", "format_sort": SORT},
+            {"format": f"b{h}[acodec!=none][vcodec!=none]/b{h}[acodec!=none]", "format_sort": SORT}]
 
 
 def pick_file(folder: str, mode: str) -> str | None:
@@ -269,7 +333,101 @@ def pick_file(folder: str, mode: str) -> str | None:
     return os.path.join(folder, max(files, key=lambda f: os.path.getsize(os.path.join(folder, f))))
 
 
-def fetch(url: str, folder: str, mode: str = "video", height: int | None = None) -> str:
+def audio_streams(path: str) -> list[str] | None:
+    """Codec names of the audio streams in a file ([] = silent). None when it can't be checked."""
+    try:
+        p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "json", path],
+                           capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+        streams = json.loads(p.stdout or b"{}").get("streams", [])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return [str(s.get("codec_name")) for s in streams if s.get("codec_type") == "audio"]
+
+
+def run_ffmpeg(args: list[str], timeout: int = 900) -> None:
+    p = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args],
+                       capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    if p.returncode != 0:
+        raise RuntimeError("ffmpeg failed: " + p.stderr.decode("utf-8", "ignore")[-300:])
+
+
+def fix_audio_codec(path: str) -> None:
+    """Some players stay silent on Opus/Vorbis audio inside an MP4. Re-encode only the audio to AAC (video is copied)."""
+    if not path.lower().endswith((".mp4", ".mov")):
+        return
+    tmp = path + ".aac.mp4"
+    try:
+        run_ffmpeg(["-i", path, "-map", "0:v?", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart", "-f", "mp4", tmp])
+        os.replace(tmp, path)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def known_silent(info: dict | None) -> bool:
+    fmts = (info or {}).get("formats") or []
+    return bool(fmts) and all(f.get("acodec") == "none" for f in fmts)
+
+
+def run_ydl(url: str, opts: dict, state: dict) -> None:
+    """Download with yt-dlp. When the look-up result is still fresh it is reused, which skips a second round of
+    page requests and signature work (the slowest part of preparing a short video)."""
+    info = state.get("info")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        if info is not None:
+            try:
+                ydl.process_ie_result(copy.deepcopy(info), download=True)
+                return
+            except yt_dlp.utils.DownloadError as e:
+                if "requested format" in str(e).lower():
+                    raise  # a real "no such format" answer: let the ladder try the next rung with the same data
+                state["info"] = None  # probably stale links: start fresh
+            except Exception:
+                state["info"] = None
+        ydl.download([url])
+
+
+def ensure_sound(url: str, folder: str, path: str, height: int | None, base: dict, state: dict) -> str:
+    """Make sure the finished video really has sound, in a codec phones can play."""
+    audio = audio_streams(path)
+    if audio is None:  # ffprobe unavailable: nothing to check with
+        return path
+    if audio:
+        if not (set(audio) & SAFE_AUDIO):
+            fix_audio_codec(path)
+        return path
+    if known_silent(state.get("info")):
+        return path  # the post genuinely has no audio track
+    alt = os.path.join(folder, "alt")
+    for extra in sound_attempts(height):
+        shutil.rmtree(alt, ignore_errors=True)
+        os.makedirs(alt, exist_ok=True)
+        try:
+            run_ydl(url, {**base, "outtmpl": os.path.join(alt, "%(title).80B [%(id)s].%(ext)s"), **extra}, state)
+        except Exception:
+            continue
+        cand = pick_file(alt, "video")
+        if cand and audio_streams(cand):
+            final = os.path.join(folder, os.path.basename(cand))
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            os.replace(cand, final)
+            shutil.rmtree(alt, ignore_errors=True)
+            if not (set(audio_streams(final) or []) & SAFE_AUDIO):
+                fix_audio_codec(final)
+            return final
+    shutil.rmtree(alt, ignore_errors=True)
+    return path  # still silent: the original has none, so deliver what we have
+
+
+def fetch(url: str, folder: str, mode: str = "video", height: int | None = None, info: dict | None = None) -> str:
+    if is_youtube(url):
+        raise RuntimeError("YouTube links are fetched through RapidAPI, not yt-dlp.")
     base = {
         "outtmpl": os.path.join(folder, "%(title).80B [%(id)s].%(ext)s"),
         "merge_output_format": "mp4",
@@ -278,40 +436,29 @@ def fetch(url: str, folder: str, mode: str = "video", height: int | None = None)
         "max_filesize": MAX_MB * 1024 * 1024,
         "socket_timeout": 20,
         "quiet": True,
+        "noprogress": True,
         "no_warnings": False,
         "retries": 3,
         "fragment_retries": 3,
-        "remote_components": ["ejs:github"],
+        "concurrent_fragment_downloads": FRAGMENT_THREADS,  # HLS/DASH videos download several pieces at once
     }
+    state = {"info": info if info and info.get("formats") else None}
     last = None
-    for extra in attempts_for(mode, url, height):
+    for extra in attempts_for(mode, height):
         clear_folder(folder)
         try:
-            with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
-                ydl.download([url])
+            run_ydl(url, {**base, **extra}, state)
         except yt_dlp.utils.DownloadError as e:
-            msg = str(e).lower()
-            if is_youtube(url) and any(x in msg for x in YT_RETRY):
-                last = e
-                continue
-            if mode == "audio" or "requested format" not in msg:
+            if mode == "audio" or "requested format" not in str(e).lower():
                 raise
             last = e
             continue
         path = pick_file(folder, mode)
         if path:
-            return path
+            return ensure_sound(url, folder, path, height, base, state) if mode == "video" else path
     if last:
         raise last
     raise RuntimeError("no file produced (it may exceed the size limit)")
-
-
-def info_attempts(url: str) -> list[dict]:
-    if not is_youtube(url):
-        return [{}]
-    out = [{"extractor_args": {"youtube": {"player_client": [c]}}, "remote_components": ["ejs:github"]} for c in YT_CLIENTS]
-    out.append({"remote_components": ["ejs:github"]})
-    return out
 
 
 def first_entry(info: dict) -> dict | None:
@@ -326,45 +473,37 @@ def has_media(entry: dict | None) -> bool:
 
 
 def lookup(url: str) -> dict:
-    """Read the video's details without downloading it (same clients, same order as the download).
-
-    The preview must never be stricter than the download itself: YouTube often hides the format
-    list from a look-up (bot checks, "page needs to be reloaded", PO tokens) while the real download
-    still works with another client. So a look-up that finds the video but no formats, or that fails
-    outright, falls back to a plain "best quality" option - exactly what Toolora's /download does.
-    """
+    """Read the video's details without downloading it. Answers from the cache when the same link was
+    looked up in the last few minutes."""
+    hit = cache_get("info:" + url)
+    if hit is not None:
+        return hit
     base = {
         "noplaylist": True,
+        "lazy_playlist": True,  # a post with many videos: only read the ones we need
         "socket_timeout": 20,
         "quiet": True,
         "no_warnings": False,
-        "retries": 3,
+        "retries": 2,
         "skip_download": True,
         "ignore_no_formats_error": True,
-        "remote_components": ["ejs:github"],
     }
-    partial = None
-    last = None
-    for extra in info_attempts(url):
-        try:
-            with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except yt_dlp.utils.DownloadError as e:
-            last = e
-            if is_youtube(url):
-                continue  # any YouTube error: try the next client, like the download does
-            break
-        entry = first_entry(info) if info else None
-        if has_media(entry):
-            return entry
-        if entry and partial is None:
-            partial = entry  # title/thumbnail without formats: still usable for the preview
-    if partial is not None:
-        return partial
-    if is_youtube(url) or last is None or "unsupported url" not in str(last).lower():
-        # Let the download step (Toolora's proven logic) decide; it reports a real error if it fails.
+    try:
+        with yt_dlp.YoutubeDL(base) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        if "unsupported url" in str(e).lower():
+            raise
+        # Let the download step decide; it reports a real error if the video truly can't be fetched.
         return {"title": None, "formats": [], "fallback": True}
-    raise last
+    entry = first_entry(info) if info else None
+    if not entry:
+        return {"title": None, "formats": [], "fallback": True}
+    if has_media(entry):
+        entry.pop("requested_formats", None)  # stale selection data; the download picks its own formats
+        entry.pop("requested_downloads", None)
+        cache_put("info:" + url, entry)
+    return entry
 
 
 # ----------------------------------------------------------------------------------------------
@@ -455,26 +594,29 @@ def snap_reachable(u: str) -> bool:
     except (MediaError, requests.RequestException):
         return False
     try:
-        return r.status_code in (200, 206) and bool(re.search(r"video|octet", r.headers.get("content-type", "")))
+        return r.status_code in (200, 206) and bool(re.search(r"video|octet|binary|mp4", r.headers.get("content-type", ""), re.I))
     finally:
         r.close()
 
 
-def first_working(urls: list[str]) -> str | None:
-    """Checks every address at the same time but keeps the order of preference."""
+def working_urls(urls: list[str]) -> list[str]:
+    """Checks every address at the same time and returns the ones that answer, in order of preference."""
     if not urls:
-        return None
+        return []
     with ThreadPoolExecutor(max_workers=len(urls)) as pool:
         ok = list(pool.map(snap_reachable, urls))
-    return urls[ok.index(True)] if True in ok else None
+    return [u for u, good in zip(urls, ok) if good]
 
 
-def resolve_snap_video(media_url: str) -> tuple[str, str]:
+def resolve_snap_video(media_url: str) -> tuple[str, str, list[str]]:
+    """-> (best address, quality label, fallback addresses to try if the best one fails at download time)."""
     m = SNAP_MEDIA_RE.match(urlparse(media_url).path)
     if m and m.group(3) == "1034":
-        return media_url, SNAP_ORIGINAL
-    clean = first_working(clean_candidates(media_url))
-    return (clean, SNAP_ORIGINAL) if clean else (media_url, SNAP_STANDARD)
+        return media_url, SNAP_ORIGINAL, []
+    good = working_urls(clean_candidates(media_url))
+    if good:
+        return good[0], SNAP_ORIGINAL, good[1:] + [media_url]  # the page's own (watermarked) copy is the last resort
+    return media_url, SNAP_STANDARD, []
 
 
 def decode_entities(v: str) -> str:
@@ -486,7 +628,8 @@ def looks_like_video_url(v: str) -> bool:
     return bool(re.match(r"^https?://", v, re.I) and (re.search(r"\.sc-cdn\.net/", v, re.I) or re.search(r"\.(mp4|mov|m4v|webm)(\?|$)", v, re.I)))
 
 
-SNAP_DEEP_RE = re.compile(r"^https?://[^\s?]*sc-cdn\.net/[^\s?]*\.\d+\.mp4(\?|$)", re.I)
+SNAP_DEEP_RE = re.compile(r"^https?://[^\s?]*sc-cdn\.net/[^\s?]*\.\d+\.(?:mp4|mov|m4v)(\?|$)", re.I)
+SNAP_RAW_RE = re.compile(r"https?://[A-Za-z0-9.-]*sc-cdn\.net/[A-Za-z0-9/_.\-]*\.\d+\.(?:mp4|mov|m4v)(?:\?[^\s\"'<>\\]*)?", re.I)
 
 
 def deep_scan_snap(node, push, depth: int = 0) -> None:
@@ -588,33 +731,69 @@ def extract_snap_media(html: str, link: str) -> tuple[list[tuple[str, str]], str
                 continue
             if looks_like_video_url(v):
                 push(v)
+
+    # Still nothing: the page text itself may hold the address (escaped inside a script the JSON route missed).
+    if not found:
+        raw = html.replace("\\u002F", "/").replace("\\/", "/").replace("&amp;", "&")
+        limit = 1 if re.search(r"/spotlight/", link, re.I) else 10
+        for m in SNAP_RAW_RE.finditer(raw):
+            push(m.group(0))
+            if len(found) >= limit:
+                break
     return found, title
+
+
+def snap_thumbnail(html: str) -> str | None:
+    """The cover picture: og:image / twitter:image (either attribute order), else the page's structured data."""
+    for tag in re.findall(r"<meta\b[^>]*>", html, re.I):
+        pm = re.search(r"""\b(?:property|name)=["']([^"']+)["']""", tag, re.I)
+        cm = re.search(r"""\bcontent=["']([^"']*)["']""", tag, re.I)
+        if pm and cm and re.match(r"^(og:image(:secure_url)?|twitter:image(:src)?)$", pm.group(1), re.I):
+            v = decode_entities(cm.group(1))
+            if v.startswith("https://"):
+                return v
+    m = re.search(r'"thumbnailUrl"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
+    if m:
+        try:
+            v = json.loads('"' + m.group(1) + '"')
+        except ValueError:
+            return None
+        if isinstance(v, str) and v.startswith("https://"):
+            return v
+    return None
 
 
 def grab_snapchat(link: str) -> dict | None:
     best = None
     snap_thumb = None
-    # Snapchat sometimes answers one kind of visitor with a block or a bare page, so try a few.
-    for ua in (BROWSER_UA, MOBILE_UA, BOT_UA):
-        try:
-            r = follow(link, {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}, is_snap_host, 20)
-        except (MediaError, requests.RequestException):
-            continue
-        try:
-            if r.status_code in (404, 410):
-                break
-            if not r.ok:
+    gone = False
+    # Snapchat sometimes answers one kind of visitor with a block, a rate limit or a bare page, and the answer can
+    # differ from one minute to the next. So: try three kinds of visitor, and if none worked, wait a moment and go round again.
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5 * attempt)
+        for ua in (BROWSER_UA, MOBILE_UA, BOT_UA):
+            try:
+                r = follow(link, {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}, is_snap_host, 20)
+            except (MediaError, requests.RequestException):
                 continue
-            html = r.raw.read(6_000_000, decode_content=True).decode(r.encoding or "utf-8", "ignore")
-        except (requests.RequestException, OSError):
-            continue
-        finally:
-            r.close()
-        found, title = extract_snap_media(html, link)
-        if found:
-            m = re.search(r"""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)""", html, re.I)
-            snap_thumb = m.group(1).replace("&amp;", "&") if m else None
-            best = (found, title)
+            try:
+                if r.status_code in (404, 410):
+                    gone = True
+                    break
+                if not r.ok:
+                    continue
+                html = r.raw.read(6_000_000, decode_content=True).decode(r.encoding or "utf-8", "ignore")
+            except (requests.RequestException, OSError):
+                continue
+            finally:
+                r.close()
+            found, title = extract_snap_media(html, link)
+            if found:
+                snap_thumb = snap_thumbnail(html)
+                best = (found, title)
+                break
+        if best or gone:
             break
     if not best:
         return None
@@ -624,12 +803,22 @@ def grab_snapchat(link: str) -> dict | None:
     medias = []
     for url, kind in found[:10]:
         if kind == "image":
-            medias.append({"url": url, "kind": "image", "ext": "jpg", "quality": ""})
+            medias.append({"url": url, "kind": "image", "ext": "jpg", "quality": "", "alts": []})
             continue
-        url, quality = resolve_snap_video(url)
-        medias.append({"url": url, "kind": "video", "ext": "mp4", "quality": quality})
+        url, quality, alts = resolve_snap_video(url)
+        medias.append({"url": url, "kind": "video", "ext": "mp4", "quality": quality, "alts": alts})
     medias = [m for m in medias if is_snap_cdn((urlparse(m["url"]).hostname or "").lower())]
     return {"title": title or "snapchat", "medias": medias, "thumbnail": thumb} if medias else None
+
+
+def grab_snapchat_cached(link: str) -> dict | None:
+    hit = cache_get("snap:" + link)
+    if hit is not None:
+        return hit
+    snap = grab_snapchat(link)
+    if snap:
+        cache_put("snap:" + link, snap)
+    return snap
 
 
 def media_fail_message(status: int) -> str:
@@ -644,19 +833,23 @@ def media_fail_message(status: int) -> str:
     return "The file could not be fetched. Try another option, or grab the link again."
 
 
-def fetch_direct(item: "Item", folder: str) -> str:
-    """Save one Snapchat media file straight from Snapchat's servers."""
+def _save_snap(url: str, item: "Item", folder: str) -> str:
+    """Save one Snapchat media address. Raises MediaError when it is refused, expired or not really a video."""
     try:
-        r = follow(item.direct["url"], {"User-Agent": BROWSER_UA, "Referer": "https://www.snapchat.com/", "Accept": "*/*"}, is_snap_cdn)
+        r = follow(url, {"User-Agent": BROWSER_UA, "Referer": "https://www.snapchat.com/", "Accept": "*/*"}, is_snap_cdn)
     except requests.RequestException:
         raise MediaError(502, media_fail_message(0))
+    path = os.path.join(folder, f"{item.id}.{item.ext}")
     try:
         if not r.ok:
             raise MediaError(r.status_code, media_fail_message(r.status_code))
+        kind = (item.direct or {}).get("kind")
+        ctype = r.headers.get("content-type", "").lower()
+        if ctype.startswith(("text/", "application/json")) or (kind == "video" and ctype.startswith("image/")):
+            raise MediaError(502, media_fail_message(0))  # an error page, not the video
         cap = MAX_MB * 1024 * 1024
         if int(r.headers.get("content-length") or 0) > cap:
             raise MediaError(413, f"That file is larger than the {MAX_MB} MB limit.")
-        path = os.path.join(folder, f"{item.id}.{item.ext}")
         size = 0
         try:
             with open(path + ".part", "wb") as out:
@@ -667,10 +860,368 @@ def fetch_direct(item: "Item", folder: str) -> str:
                     out.write(chunk)
         except requests.RequestException:
             raise MediaError(502, media_fail_message(0))
+        if size < 1024:  # an empty or truncated answer
+            raise MediaError(502, media_fail_message(0))
         os.replace(path + ".part", path)
         return path
     finally:
         r.close()
+        if os.path.exists(path + ".part"):
+            try:
+                os.remove(path + ".part")
+            except OSError:
+                pass
+
+
+def fetch_direct(item: "Item", folder: str) -> str:
+    """Save one Snapchat media file straight from Snapchat's servers.
+    Every known address is tried in turn. If they all fail (the signed addresses expire), the Snapchat page is read
+    again for fresh ones and those are tried too, so a stale look-up no longer ends in a failed download."""
+    d = item.direct or {}
+    urls = [d["url"]] + [u for u in d.get("alts", []) if u != d["url"]]
+    last: MediaError | None = None
+
+    def attempt(candidates: list[str]) -> str | None:
+        nonlocal last
+        for u in candidates:
+            try:
+                return _save_snap(u, item, folder)
+            except MediaError as e:
+                if e.status == 413:
+                    raise
+                last = e
+        return None
+
+    got = attempt(urls)
+    if got:
+        return got
+    if is_snap_host((urlparse(item.source).hostname or "").lower()):
+        cache_put("snap:" + item.source, None)  # forget the stale look-up
+        fresh = grab_snapchat(item.source)
+        if fresh:
+            cache_put("snap:" + item.source, fresh)
+            mid = (SNAP_MEDIA_RE.match(urlparse(d["url"]).path) or [None, None, None])[2]
+            pool = [m for m in fresh["medias"] if m["kind"] == d.get("kind")]
+            same = [m for m in pool if mid and any(mid in u for u in [m["url"], *m.get("alts", [])])] or pool[:1]
+            for m in same:
+                got = attempt([m["url"], *m.get("alts", [])])
+                if got:
+                    return got
+    raise last or MediaError(502, media_fail_message(0))
+
+
+# ----------------------------------------------------------------------------------------------
+# YouTube through RapidAPI (the only way YouTube links are handled)
+# ----------------------------------------------------------------------------------------------
+# One call to the API's "video details" endpoint returns the title, thumbnail, duration and direct links:
+#   * "videos": ready-made files that already contain sound (usually up to 720p), and
+#   * higher qualities as VIDEO-ONLY files, plus separate "audios".
+# Video-only files have no sound, so those are downloaded together with the best audio track and joined with
+# ffmpeg (no re-encoding of the video). That is what keeps long / high-quality videos from coming out silent.
+PART_BYTES = 8 * 1024 * 1024  # size of each piece downloaded in parallel
+MEDIA_HEADERS = {"User-Agent": BROWSER_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"}
+rapid = requests.Session()  # keeps the connection to RapidAPI open between calls (faster repeat look-ups)
+YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def youtube_id(url: str) -> str | None:
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        m = re.match(r"^/([A-Za-z0-9_-]{11})", p.path)
+        return m.group(1) if m else None
+    v = (parse_qs(p.query).get("v") or [""])[0]
+    if YT_ID.match(v):
+        return v
+    m = re.match(r"^/(?:shorts|embed|live|v|e)/([A-Za-z0-9_-]{11})", p.path)
+    return m.group(1) if m else None
+
+
+def yt_details(video_id: str, fresh: bool = False) -> dict:
+    """Ask RapidAPI about one video (cached for a few minutes; `fresh` skips the cache after a link expired)."""
+    if not fresh:
+        hit = cache_get("yt:" + video_id)
+        if hit is not None:
+            return hit
+    if not RAPIDAPI_KEY:
+        raise MediaError(503, "YouTube downloads are not switched on yet. The site owner needs to add a RAPIDAPI_KEY on the server.")
+    try:
+        r = rapid.get(f"https://{RAPIDAPI_HOST}{RAPIDAPI_PATH}",
+                      params={"videoId": video_id, "urlAccess": "normal", "videos": "true", "audios": "true"},
+                      headers={"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST},
+                      timeout=(8, 30))
+    except requests.RequestException:
+        raise MediaError(502, "Couldn't reach the YouTube service. Try again in a moment.")
+    if r.status_code in (401, 403):
+        print("RapidAPI refused the key:", r.status_code, r.text[:200])
+        raise MediaError(503, "The YouTube service refused this server's RapidAPI key. The site owner should check RAPIDAPI_KEY and the API subscription.")
+    if r.status_code == 429:
+        raise MediaError(429, "The YouTube service has reached its request limit for now. Try again later.")
+    if not r.ok:
+        raise MediaError(502, f"The YouTube service had a problem ({r.status_code}). Try again in a moment.")
+    try:
+        data = r.json()
+    except ValueError:
+        raise MediaError(502, "The YouTube service sent an unreadable answer. Try again in a moment.")
+    if not isinstance(data, dict) or data.get("status") is False:
+        reason = str(data.get("reason") or data.get("errorId") or "") if isinstance(data, dict) else ""
+        raise MediaError(422, f"YouTube says this video can't be fetched{': ' + reason[:120] if reason else ''}.")
+    cache_put("yt:" + video_id, data)
+    return data
+
+
+def yt_items(block) -> list[dict]:
+    if isinstance(block, dict):
+        block = block.get("items")
+    return [x for x in (block or []) if isinstance(x, dict) and isinstance(x.get("url"), str) and x["url"].startswith("https://")]
+
+
+def yt_streams(data: dict) -> tuple[list[dict], list[dict]]:
+    return yt_items(data.get("videos")), yt_items(data.get("audios"))
+
+
+def item_height(x: dict) -> int | None:
+    m = re.search(r"(\d{3,4})p", str(x.get("quality") or x.get("qualityLabel") or ""))  # "1080p60" -> 1080 (also right for Shorts)
+    if m:
+        return int(m.group(1))
+    h = x.get("height")
+    return int(h) if isinstance(h, (int, float)) and h > 0 else None
+
+
+def item_size(x: dict) -> int:
+    try:
+        return int(x.get("size") or x.get("contentLength") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def item_mime(x: dict) -> str:
+    return f"{x.get('mimeType') or x.get('mime_type') or ''} {x.get('extension') or ''}".lower()
+
+
+def is_mp4(x: dict) -> bool:
+    m = item_mime(x)
+    return "mp4" in m and "av01" not in m and "vp9" not in m  # H.264 in MP4 plays everywhere
+
+
+def is_aac(x: dict) -> bool:
+    m = item_mime(x)
+    return "mp4a" in m or "audio/mp4" in m or "m4a" in m
+
+
+def best_audio(audios: list[dict], want_aac: bool = False) -> dict | None:
+    return max(audios, key=lambda x: (is_aac(x) if want_aac else False, item_size(x)), default=None)
+
+
+def usable_videos(videos: list[dict], audios: list[dict]) -> list[dict]:
+    """Videos that can become a playable MP4 *with sound* and fit the size cap."""
+    cap = MAX_MB * 1024 * 1024
+    audio_size = max((item_size(a) for a in audios), default=0)
+    out = []
+    for x in videos:
+        has = bool(x.get("hasAudio"))
+        if has and not is_mp4(x):
+            continue  # a finished file in an odd container: skip it rather than save a broken .mp4
+        if not has and not audios:
+            continue  # video-only and nothing to join it with: would be silent
+        if item_size(x) and item_size(x) + (0 if has else audio_size) > cap:
+            continue
+        out.append(x)
+    return out
+
+
+def pick_video(usable: list[dict], height: int | None) -> dict | None:
+    pool = usable
+    if height is not None:
+        known = [x for x in usable if item_height(x)]
+        exact = [x for x in known if item_height(x) == height]
+        if exact:
+            pool = exact
+        else:
+            below = [x for x in known if item_height(x) <= height]  # asked quality vanished: nearest one below
+            top = max((item_height(x) for x in below), default=None)
+            pool = [x for x in below if item_height(x) == top]
+    # at the same height prefer a finished file with sound (no joining needed), then H.264, then the biggest
+    return max(pool, key=lambda x: (bool(x.get("hasAudio")), is_mp4(x), item_size(x)), default=None)
+
+
+def yt_thumbnail(data: dict, video_id: str) -> str:
+    thumbs = [t for t in (data.get("thumbnails") or []) if isinstance(t, dict) and str(t.get("url", "")).startswith("https://")]
+    if thumbs:
+        return max(thumbs, key=lambda t: t.get("width") or 0)["url"]
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
+def too_big() -> MediaError:
+    return MediaError(413, f"That file is larger than the {MAX_MB} MB limit.")
+
+
+def _any_host(_h: str) -> bool:
+    return True  # the address itself is still checked by safe_host() inside follow()
+
+
+def _fetch_whole(url: str, part: str, cap: int) -> None:
+    r = follow(url, MEDIA_HEADERS, _any_host, 60)
+    try:
+        if not r.ok:
+            raise MediaError(r.status_code, media_fail_message(r.status_code))
+        size = 0
+        with open(part, "wb") as out:
+            for chunk in r.iter_content(262144):
+                size += len(chunk)
+                if size > cap:
+                    raise too_big()
+                out.write(chunk)
+    except requests.RequestException:
+        raise MediaError(502, media_fail_message(0))
+    finally:
+        r.close()
+
+
+def _fetch_in_parts(url: str, part: str, total: int) -> bool:
+    """Download several slices at once. Returns False if the server doesn't cooperate (the caller then streams normally)."""
+    ranges = [(s, min(s + PART_BYTES, total) - 1) for s in range(0, total, PART_BYTES)]
+    sess = requests.Session()
+
+    def one(rng: tuple[int, int]) -> None:
+        start, end = rng
+        for attempt in range(3):
+            try:
+                r = sess.get(url, headers={**MEDIA_HEADERS, "Range": f"bytes={start}-{end}"}, stream=True,
+                             allow_redirects=False, timeout=(15, 60))
+                try:
+                    if r.status_code != 206:
+                        raise OSError(f"unexpected status {r.status_code}")
+                    pos = start
+                    with open(part, "r+b") as f:
+                        f.seek(start)
+                        for chunk in r.iter_content(262144):
+                            f.write(chunk)
+                            pos += len(chunk)
+                    if pos != end + 1:
+                        raise OSError("short slice")
+                    return
+                finally:
+                    r.close()
+            except (requests.RequestException, OSError):
+                if attempt == 2:
+                    raise
+
+    try:
+        with open(part, "wb") as f:
+            f.truncate(total)
+        with ThreadPoolExecutor(max_workers=DL_WORKERS) as pool:
+            list(pool.map(one, ranges))
+        return True
+    except (requests.RequestException, OSError):
+        return False
+    finally:
+        sess.close()
+
+
+def download_to(url: str, dest: str, cap: int) -> None:
+    """Save one media file. Large files are fetched as parallel slices (much faster than one connection)."""
+    try:
+        r = follow(url, {**MEDIA_HEADERS, "Range": "bytes=0-0"}, _any_host, 30)
+    except requests.RequestException:
+        raise MediaError(502, media_fail_message(0))
+    try:
+        final, ranged, total = r.url, False, 0
+        if r.status_code == 206:
+            tail = r.headers.get("content-range", "").rsplit("/", 1)[-1]
+            total = int(tail) if tail.isdigit() else 0
+            ranged = total > 0
+        elif r.ok:
+            total = int(r.headers.get("content-length") or 0)
+        else:
+            raise MediaError(r.status_code, media_fail_message(r.status_code))
+    finally:
+        r.close()
+    if total > cap:
+        raise too_big()
+    part = dest + ".part"
+    try:
+        if not (ranged and total >= 2 * PART_BYTES and DL_WORKERS > 1 and _fetch_in_parts(final, part, total)):
+            _fetch_whole(final, part, cap)
+        os.replace(part, dest)
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+
+
+def build_youtube(data: dict, item: "Item", folder: str) -> str:
+    cap = MAX_MB * 1024 * 1024
+    videos, audios = yt_streams(data)
+    out = os.path.join(folder, f"{item.id}.{item.ext}")
+
+    if item.mode == "audio":
+        src = best_audio(audios)
+        if src is None:  # no separate audio offered: take it from the smallest finished video
+            src = min((x for x in videos if x.get("hasAudio")), key=lambda x: item_size(x) or 1 << 60, default=None)
+        if src is None:
+            raise MediaError(422, "YouTube offered no audio for this video.")
+        tmp = os.path.join(folder, "audio.src")
+        download_to(src["url"], tmp, cap)
+        run_ffmpeg(["-i", tmp, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", out])
+        os.remove(tmp)
+        return out
+
+    video = pick_video(usable_videos(videos, audios), item.height)
+    if video is None:
+        raise MediaError(422, "That quality isn't available for this video. Grab the link again and pick another.")
+    if video.get("hasAudio"):  # already a complete file
+        download_to(video["url"], out, cap)
+        return out
+
+    audio = best_audio(audios, want_aac=is_mp4(video))
+    vtmp, atmp = os.path.join(folder, "video.src"), os.path.join(folder, "audio.src")
+    with ThreadPoolExecutor(max_workers=2) as pool:  # picture and sound download at the same time
+        jobs = [pool.submit(download_to, video["url"], vtmp, cap), pool.submit(download_to, audio["url"], atmp, cap)]
+        for j in jobs:
+            j.result()
+    run_ffmpeg(["-i", vtmp, "-i", atmp, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                *(["-c:a", "copy"] if is_aac(audio) else ["-c:a", "aac", "-b:a", "192k"]),
+                "-shortest", "-movflags", "+faststart", "-f", "mp4", out])
+    for t in (vtmp, atmp):
+        os.remove(t)
+    if os.path.getsize(out) > cap:
+        raise too_big()
+    return out
+
+
+def fetch_youtube(item: "Item", folder: str) -> str:
+    vid = item.yt["id"]
+    for attempt in (0, 1):
+        data = yt_details(vid, fresh=attempt == 1)
+        try:
+            return build_youtube(data, item, folder)
+        except MediaError as e:
+            if attempt == 0 and e.status in (403, 404, 410):  # the links in the answer expire: ask once more for new ones
+                clear_folder(folder)
+                continue
+            raise
+    raise MediaError(502, media_fail_message(0))
+
+
+def youtube_options(video_id: str, data: dict) -> list[dict]:
+    title = clean_title(data.get("title"))
+    videos, audios = yt_streams(data)
+    usable = usable_videos(videos, audios)
+    link = f"https://www.youtube.com/watch?v={video_id}"
+    heights = sorted({item_height(x) for x in usable if item_height(x)}, reverse=True)[:4]
+    out = []
+    for h in heights or ([None] if usable else []):
+        it = register(source=link, mode="video", title=title, ext="mp4", height=h, yt={"id": video_id})
+        out.append(option(it, f"Video · {h}p" if h else "Video"))
+    if audios or any(x.get("hasAudio") for x in videos):
+        it = register(source=link, mode="audio", title=title, ext="mp3", yt={"id": video_id})
+        out.append(option(it, "Audio"))
+    if not out:
+        raise too_big() if videos else MediaError(422, "No downloadable video or audio was found for this link.")
+    return out
 
 
 # ----------------------------------------------------------------------------------------------
@@ -685,6 +1236,8 @@ class Item:
     ext: str
     height: int | None = None        # the quality the visitor picked (None = best)
     direct: dict | None = None       # Snapchat: {"url": media address, "kind": "video" | "image"}
+    yt: dict | None = None           # YouTube (RapidAPI): {"id": video id}
+    info: dict | None = None         # yt-dlp's look-up result, reused by the download while it is fresh
     created: float = field(default_factory=time.time)
     touched: float = field(default_factory=time.time)
     path: str | None = None          # the finished file, once prepared
@@ -747,9 +1300,12 @@ def clean_title(t) -> str:
 
 
 def build(item: Item, folder: str) -> str:
+    if item.yt:
+        return fetch_youtube(item, folder)
     if item.direct:
         return fetch_direct(item, folder)
-    return fetch(item.source, folder, item.mode, item.height)
+    fresh = item.info if time.time() - item.created < INFO_TTL else None
+    return fetch(item.source, folder, item.mode, item.height, fresh)
 
 
 def why(e: Exception) -> str:
@@ -766,13 +1322,14 @@ async def _build(item: Item) -> str:
         return path
     except MediaError as e:
         shutil.rmtree(folder, ignore_errors=True)
-        raise HTTPException(502, str(e))
+        raise HTTPException(e.status if e.status in (413, 422, 429, 503) else 502, str(e))
     except Exception as e:
         shutil.rmtree(folder, ignore_errors=True)
         what = "extract the audio from" if item.mode == "audio" else "download"
         raise HTTPException(422, f"Couldn't {what} that video: {why(e)}")
     finally:
         item.task = None
+        item.info = None
 
 
 async def prepare(item: Item) -> str:
@@ -827,13 +1384,31 @@ def option(item: Item, label: str) -> dict:
 
 def options_from_info(url: str, entry: dict) -> list[dict]:
     title = clean_title(entry.get("title"))
+    known = entry if entry.get("formats") else None
     out = []
     for h in video_heights(entry) or [None]:
-        item = register(source=url, mode="video", title=title, ext="mp4", height=h)
+        item = register(source=url, mode="video", title=title, ext="mp4", height=h, info=known)
         out.append(option(item, f"Video · {h}p" if h else "Video"))
-    audio = register(source=url, mode="audio", title=title, ext="mp3")
+    audio = register(source=url, mode="audio", title=title, ext="mp3", info=known)
     out.append(option(audio, "Audio"))
     return out
+
+
+def pick_preview(options: list[dict], first: bool = False) -> str | None:
+    """Which option the thumbnail's play button streams. Snapchat: the first video (it is the snap shown).
+    Other sites: the smallest video of at least 360p (quick to prepare), else the smallest there is."""
+    vids = [o for o in options if o.get("kind") == "video"]
+    if not vids:
+        return None
+    if first or len(vids) == 1:
+        return vids[0]["url"]
+
+    def h(o: dict) -> int:
+        m = re.search(r"(\d+)p", o.get("label", ""))
+        return int(m.group(1)) if m else 0
+
+    ok = [o for o in vids if h(o) >= 360]
+    return (min(ok, key=h) if ok else min(vids, key=h))["url"]
 
 
 def options_from_snap(link: str, snap: dict) -> list[dict]:
@@ -842,7 +1417,7 @@ def options_from_snap(link: str, snap: dict) -> list[dict]:
     picked = videos or [m for m in snap["medias"] if m["kind"] == "image"][:4]
     out = []
     for i, m in enumerate(picked, 1):
-        item = register(source=link, mode="video", title=title, ext=m["ext"], direct={"url": m["url"], "kind": m["kind"]})
+        item = register(source=link, mode="video", title=title, ext=m["ext"], direct={"url": m["url"], "kind": m["kind"], "alts": m.get("alts", [])})
         if m["kind"] == "image":
             label = "Image"
         else:
@@ -877,12 +1452,31 @@ async def grab(req: Req, request: Request):
         raise HTTPException(502, "Could not open that link. Check it or try again.")
 
     platform = platform_of(url)
+    if is_youtube(url):  # YouTube: RapidAPI only
+        vid = youtube_id(url)
+        if not vid:
+            raise HTTPException(400, "That YouTube link doesn't point to a single video. Paste a video, Shorts or youtu.be link.")
+        async with grab_slots:
+            try:
+                data = await asyncio.to_thread(yt_details, vid)
+                options = youtube_options(vid, data)
+            except MediaError as e:
+                raise HTTPException(e.status if 400 <= e.status < 600 else 502, str(e))
+        length = data.get("lengthSeconds") or data.get("duration")
+        try:
+            length = float(length)
+        except (TypeError, ValueError):
+            length = None
+        return {"title": clean_title(data.get("title")), "platform": platform, "thumbnail": yt_thumbnail(data, vid),
+                "duration": length, "options": options, "preview": pick_preview(options)}
+
     async with grab_slots:
         if is_snap_host((urlparse(url).hostname or "").lower()):
-            snap = await asyncio.to_thread(grab_snapchat, url)
+            snap = await asyncio.to_thread(grab_snapchat_cached, url)
             if snap:
+                opts = options_from_snap(url, snap)
                 return {"title": clean_title(snap["title"]), "platform": platform, "thumbnail": snap.get("thumbnail"), "duration": None,
-                        "options": options_from_snap(url, snap)}
+                        "options": opts, "preview": pick_preview(opts, first=True)}
         try:
             entry = await asyncio.to_thread(lookup, url)
         except Exception as e:
@@ -892,17 +1486,19 @@ async def grab(req: Req, request: Request):
 
     thumb = entry.get("thumbnail")
     duration = entry.get("duration")
+    opts = options_from_info(url, entry)
     return {
         "title": clean_title(entry.get("title")),
         "platform": platform,
         "thumbnail": thumb if isinstance(thumb, str) and thumb.startswith("https://") else None,
         "duration": duration if isinstance(duration, (int, float)) else None,
-        "options": options_from_info(url, entry),
+        "options": opts,
+        "preview": pick_preview(opts),
     }
 
 
 @app.get("/api/download/{item_id}")
-async def download(item_id: str, request: Request, probe: int = 0):
+async def download(item_id: str, request: Request, probe: int = 0, inline: int = 0):
     check_proxy(request)
     item = items.get(item_id) if ID_RE.match(item_id) else None
     if not item:
@@ -915,6 +1511,7 @@ async def download(item_id: str, request: Request, probe: int = 0):
     ext = os.path.splitext(path)[1].lower()
     return FileResponse(path, media_type=MEDIA_MIME.get(ext, "application/octet-stream"),
                         filename=f"{item.title}{ext}",
+                        content_disposition_type="inline" if inline else "attachment",  # inline = the page's play button
                         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 

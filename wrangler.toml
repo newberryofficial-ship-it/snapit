@@ -9,3 +9,7 @@ run_worker_first = ["/api/*"]
 
 [vars]
 BACKEND_URL = "https://snapit-fp69.onrender.com"
+
+# Wake the Render backend every 2 minutes so it never goes to sleep (calls scheduled() in src/index.js)
+[triggers]
+crons = ["*/2 * * * *"]

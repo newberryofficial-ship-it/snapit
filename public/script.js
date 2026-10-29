@@ -6,6 +6,34 @@
 const API_BASE = '';
 const ENDPOINT = API_BASE + '/api/grab';
 
+/* Wake-up: the first request after a long break can be slow while the server starts. Pinging /api/health as soon
+   as the page opens (and whenever the tab comes back) lets it wake up while the visitor is still pasting a link. */
+let lastWarm = 0;
+function warmUp() {
+  if (Date.now() - lastWarm < 60000) return;
+  lastWarm = Date.now();
+  fetch(API_BASE + '/api/health', { cache: 'no-store' }).catch(() => {});
+}
+warmUp();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) warmUp(); });
+
+/* POST that tries again (up to 3 times) when the server is still waking up: network error, or a gateway page
+   instead of our JSON answer. Real answers from SnapIT (including its error messages) are returned straight away. */
+async function postWithRetry(url, init) {
+  let last;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch(url, init);
+      const isJson = (res.headers.get('content-type') || '').includes('application/json');
+      if (isJson || ![502, 503, 504].includes(res.status)) return res;
+      last = res;
+    } catch (e) { last = e; }
+    await new Promise(r => setTimeout(r, 2500));
+  }
+  if (last instanceof Response) return last;
+  throw last;
+}
+
 const PLATFORMS = [
   { id: 'youtube',   name: 'YouTube',   hosts: ['youtube.com', 'youtu.be'] },
   { id: 'pinterest', name: 'Pinterest', hosts: ['pinterest.com', 'pin.it'] },
@@ -35,6 +63,7 @@ const ICONS = {
   check: `<svg viewBox="0 0 24 24" ${STROKE}><path d="M20 6 9 17l-5-5"/></svg>`,
   sparkles: `<svg viewBox="0 0 24 24" ${STROKE}><path d="m12 3 1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3Z"/></svg>`,
   arrowUpRight: `<svg viewBox="0 0 24 24" ${STROKE}><path d="M7 7h10v10"/><path d="M7 17 17 7"/></svg>`,
+  play: `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14Z"/></svg>`,
   loader: `<svg viewBox="0 0 24 24" ${STROKE}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`,
 };
 
@@ -104,8 +133,14 @@ function showError(message) {
   status.querySelector('.result-message').appendChild(dismiss);
 }
 
+let slowTimer = null;
 function showLoading() {
-  status.innerHTML = `<div class="loading-status"><span class="loading-dots"><i></i><i></i><i></i></span>Finding your moment…</div>`;
+  status.innerHTML = `<div class="loading-status"><span class="loading-dots"><i></i><i></i><i></i></span><span class="loading-text">Finding your moment…</span></div>`;
+  clearTimeout(slowTimer);
+  slowTimer = setTimeout(() => {   // still waiting after 7s: the server is probably waking up
+    const t = status.querySelector('.loading-text');
+    if (t && loading) t.textContent = 'Waking things up, almost there…';
+  }, 7000);
 }
 
 /* Video titles come from other people's uploads, so never put them into HTML raw. */
@@ -162,6 +197,62 @@ function fmtDuration(sec) {
   return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
 }
 
+/* Play button: the server prepares the video (the same file the Download button would give), then it plays inline.
+   If the browser cannot play that format, the message says so and the download buttons still work. */
+async function playPreview({ card, media, play, note, thumb, src }) {
+  if (play.disabled) return;
+  play.disabled = true;
+  media.classList.add('is-busy');
+  play.innerHTML = `<span class="spinner">${ICONS.loader}</span>`;
+  play.setAttribute('aria-label', 'Loading video');
+  note.hidden = true;
+  const reset = msg => {
+    media.classList.remove('is-busy');
+    play.disabled = false;
+    play.innerHTML = ICONS.play;
+    play.setAttribute('aria-label', 'Play video');
+    if (msg) { note.textContent = msg; note.hidden = false; }
+  };
+  try {
+    const res = await fetch(src + '?probe=1');
+    let data = {};
+    try { data = await res.json(); } catch {}
+    if (!res.ok || data.error) throw new Error(data.error || 'The video could not be loaded. Try again, or use a download button.');
+  } catch (e) {
+    reset(e instanceof TypeError ? 'Could not reach the SnapIT server. Check your connection and try again.' : e.message);
+    return;
+  }
+  if (!media.isConnected) return; // a new link was grabbed meanwhile
+  const video = document.createElement('video');
+  video.controls = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.setAttribute('playsinline', '');
+  if (thumb) video.poster = thumb;
+  video.addEventListener('loadedmetadata', () => {   // fit the frame to the video (portrait Snaps stay tall and narrow)
+    if (video.videoWidth && video.videoHeight) {
+      const portrait = video.videoHeight > video.videoWidth;
+      media.style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
+      media.style.width = portrait ? 'min(100%, 300px)' : '100%';
+    }
+  }, { once: true });
+  video.addEventListener('error', () => {
+    video.remove();
+    media.classList.remove('is-playing', 'is-busy');
+    media.style.aspectRatio = media.style.width = '';
+    card.classList.remove('is-playing');
+    play.hidden = false;
+    reset('This video can\u2019t be played in your browser, but the download buttons below still work.');
+  }, { once: true });
+  video.src = src + '?inline=1&t=' + Date.now();
+  media.appendChild(video);
+  media.classList.remove('is-busy');
+  media.classList.add('is-playing');
+  card.classList.add('is-playing');
+  play.hidden = true;
+  video.play().catch(() => {}); // if the browser wants a tap first, the player's own play button is right there
+}
+
 /* Thumbnail + title card shown above the download buttons. */
 function previewCard(info) {
   const card = document.createElement('div');
@@ -189,8 +280,25 @@ function previewCard(info) {
   title.textContent = info.title || 'Your video';
   const plat = document.createElement('small');
   plat.textContent = info.platform || '';
+  const note = document.createElement('small');
+  note.className = 'preview-note';
+  note.hidden = true;
+  note.setAttribute('role', 'alert');
   text.appendChild(title);
   text.appendChild(plat);
+  text.appendChild(note);
+  /* Play button in the middle of the thumbnail: streams the fetched video right here on the page. */
+  if (typeof info.preview === 'string' && info.preview.startsWith('/api/download/')) {
+    const play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'preview-play';
+    play.setAttribute('aria-label', 'Play video');
+    play.title = 'Play video';
+    play.innerHTML = ICONS.play;
+    media.classList.add('has-play');
+    play.addEventListener('click', () => playPreview({ card, media, play, note, thumb, src: API_BASE + info.preview }));
+    media.appendChild(play);
+  }
   card.appendChild(media);
   card.appendChild(text);
   return card;
@@ -229,6 +337,7 @@ function showResults(options, info) {
 
 function setLoading(state) {
   loading = state;
+  if (!state) clearTimeout(slowTimer);
   form.classList.toggle('is-loading', state);
   input.disabled = state;
   grabBtn.disabled = state;
@@ -282,7 +391,7 @@ async function submit(event) {
   }
 
   try {
-    const res = await fetch(ENDPOINT, {
+    const res = await postWithRetry(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: value }),

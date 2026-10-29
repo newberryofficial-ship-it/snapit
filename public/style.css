@@ -149,7 +149,23 @@ a { color: inherit; }
 .preview-text { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .preview-text strong { font-size: 14px; line-height: 1.35; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .preview-text small { font-size: 11px; color: var(--muted-foreground); }
-@media (max-width: 520px) { .preview-thumb { width: 110px; } }
+.preview-note { color: var(--destructive, #c0392b); line-height: 1.5; }
+/* Play button over the middle of the thumbnail */
+.preview-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; padding: 0; border: 1.5px solid rgba(255,255,255,.85); border-radius: 50%; display: grid; place-items: center; color: #fff; background: rgba(0,0,0,.5); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); box-shadow: 0 4px 18px rgba(0,0,0,.35); cursor: pointer; transition: transform .2s ease, background .2s ease; z-index: 2; }
+.preview-play svg { width: 20px; height: 20px; margin-left: 2px; } /* nudged so the triangle looks centred */
+.preview-play:hover:not(:disabled) { transform: translate(-50%, -50%) scale(1.1); background: rgba(0,0,0,.68); }
+.preview-play:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.preview-play:disabled { cursor: progress; }
+.preview-play .spinner { display: grid; place-items: center; }
+.preview-play .spinner svg { margin-left: 0; }
+.preview-thumb.has-play .preview-fallback { display: none; }
+.preview-thumb.is-busy img { filter: brightness(.7); }
+/* While playing, the card opens up: the video gets the full width above the title */
+.preview-card.is-playing { flex-direction: column; align-items: stretch; }
+.preview-thumb.is-playing { width: 100%; aspect-ratio: 16 / 9; max-height: 72vh; margin: 0 auto; background: #000; }
+.preview-thumb.is-playing video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+.preview-thumb.is-playing img, .preview-thumb.is-playing .preview-time { display: none; }
+@media (max-width: 520px) { .preview-thumb { width: 110px; } .preview-play { width: 36px; height: 36px; } .preview-play svg { width: 16px; height: 16px; } }
 .download-row { display: flex; gap: 14px; align-items: center; background: var(--glass); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin: 8px 0; backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px); animation: arrive .5s ease both; }
 .format-icon { width: 36px; height: 36px; display: grid; place-items: center; background: var(--accent); border-radius: 8px; color: var(--primary); }
 .format-icon svg { width: 18px; height: 18px; }
