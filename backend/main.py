@@ -10,7 +10,11 @@ How a download works (same logic as Toolora's /download):
   * YouTube is handled ONLY through RapidAPI (set RAPIDAPI_KEY); every other site goes through yt-dlp
   * yt-dlp fetches the video with a format ladder, then checks the file really has sound (and repairs it if not)
   * "video" options give an MP4 that fits the size cap, "audio" options give the sound only as an MP3
-  * Snapchat links are read straight from Snapchat's public page (no watermark when the clean copy exists)
+  * Snapchat links are read straight from Snapchat's public page (no watermark when the clean copy exists; if that
+    copy can't be fetched the standard copy, which may show a watermark, is saved instead of failing)
+  * TikTok / Instagram / X posts that hold PICTURES (or that yt-dlp can't read) are read by social.py instead, and the
+    pictures are offered as JPG downloads (plus one ZIP of the whole carousel). If one way of reading a post fails
+    the next one is tried; a failed yt-dlp download is retried through social.py.
 SnapIT adds one step on top of Toolora: /api/grab looks the link up first so the page can show a preview
 (title, thumbnail, available qualities) before anything is downloaded.
 
@@ -33,6 +37,8 @@ Env vars (all optional):
   FRAGMENT_THREADS      parallel fragment downloads inside yt-dlp (default 4)
   KEEP_ALIVE_SECONDS    the service pings its own public address this often so Render never sleeps (default 120; 0 = off)
   KEEP_ALIVE_URL        address to ping (default: RENDER_EXTERNAL_URL, which Render sets automatically)
+  X_FALLBACK_API        public API used as the last layer for X posts (default: https://api.fxtwitter.com; empty = off)
+  YTDLP_IMPERSONATE     browser yt-dlp pretends to be for TikTok (default: chrome; empty = off). Needs curl_cffi.
 """
 import asyncio, copy, hmac, ipaddress, json, os, re, secrets, shutil, subprocess, tempfile, threading, time
 from collections import defaultdict, deque
@@ -51,6 +57,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from social import MediaError, any_host, follow, read_post, safe_host, save_media, save_zip  # noqa: F401
+
+try:  # lets yt-dlp look like a real browser to TikTok (needs the curl_cffi package)
+    import curl_cffi  # noqa: F401
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    IMPERSONATE = ImpersonateTarget("chrome", None, None, None) if os.getenv("YTDLP_IMPERSONATE", "chrome").strip() else None
+except Exception:
+    IMPERSONATE = None
 
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 MAX_MB = int(os.getenv("MAX_FILESIZE_MB", "200"))
@@ -81,7 +96,8 @@ PLATFORMS = (("youtube.com", "YouTube"), ("youtu.be", "YouTube"), ("pinterest.co
 BAD_LINK = "Paste a valid HTTPS video link from a supported platform."
 MEDIA_MIME = {".mp3": "audio/mpeg", ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
               ".mov": "video/quicktime", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-              ".webp": "image/webp", ".gif": "image/gif"}
+              ".webp": "image/webp", ".gif": "image/gif", ".zip": "application/zip",
+              ".heic": "image/heic", ".avif": "image/avif"}
 
 ID_RE = re.compile(r"^[a-f0-9]{24}$")
 
@@ -372,7 +388,22 @@ def known_silent(info: dict | None) -> bool:
     return bool(fmts) and all(f.get("acodec") == "none" for f in fmts)
 
 
+def impersonation_for(url: str) -> dict:
+    host = (urlparse(url).hostname or "").lower()
+    return {"impersonate": IMPERSONATE} if IMPERSONATE and (host == "tiktok.com" or host.endswith(".tiktok.com")) else {}
+
+
 def run_ydl(url: str, opts: dict, state: dict) -> None:
+    try:
+        _run_ydl(url, opts, state)
+    except yt_dlp.utils.DownloadError as e:
+        if "impersonate" in opts and "imperson" in str(e).lower():  # the browser copy isn't available here: go without it
+            _run_ydl(url, {k: v for k, v in opts.items() if k != "impersonate"}, state)
+        else:
+            raise
+
+
+def _run_ydl(url: str, opts: dict, state: dict) -> None:
     """Download with yt-dlp. When the look-up result is still fresh it is reused, which skips a second round of
     page requests and signature work (the slowest part of preparing a short video)."""
     info = state.get("info")
@@ -441,6 +472,7 @@ def fetch(url: str, folder: str, mode: str = "video", height: int | None = None,
         "retries": 3,
         "fragment_retries": 3,
         "concurrent_fragment_downloads": FRAGMENT_THREADS,  # HLS/DASH videos download several pieces at once
+        **impersonation_for(url),
     }
     state = {"info": info if info and info.get("formats") else None}
     last = None
@@ -487,10 +519,17 @@ def lookup(url: str) -> dict:
         "retries": 2,
         "skip_download": True,
         "ignore_no_formats_error": True,
+        **impersonation_for(url),
     }
     try:
-        with yt_dlp.YoutubeDL(base) as ydl:
-            info = ydl.extract_info(url, download=False)
+        try:
+            with yt_dlp.YoutubeDL(base) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as e:
+            if "impersonate" not in base or "imperson" not in str(e).lower():
+                raise
+            with yt_dlp.YoutubeDL({k: v for k, v in base.items() if k != "impersonate"}) as ydl:
+                info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
         if "unsupported url" in str(e).lower():
             raise
@@ -521,49 +560,12 @@ SNAP_STANDARD = "Standard · may show watermark"
 SNAP_FAIL = "This Snapchat video could not be read. It may be private, removed or not public."
 
 
-class MediaError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-
-
 def is_snap_host(h: str) -> bool:
     return h == "snapchat.com" or h.endswith(".snapchat.com")
 
 
 def is_snap_cdn(h: str) -> bool:
     return h.endswith(".sc-cdn.net") or h.endswith(".snapchat.com")
-
-
-def safe_host(h: str | None) -> bool:
-    """Refuse addresses that point back at this machine or its network."""
-    h = (h or "").lower().strip("[]")
-    if not h or h == "localhost" or h.endswith((".localhost", ".local", ".internal")):
-        return False
-    try:
-        ip = ipaddress.ip_address(h)
-    except ValueError:
-        return True
-    if ip.version == 6:
-        return False
-    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified)
-
-
-def follow(url: str, headers: dict, host_ok, timeout: int = 60):
-    """Follow redirects by hand so every hop is checked, not just the first address."""
-    for _ in range(6):
-        p = urlparse(url)
-        host = (p.hostname or "").lower()
-        if p.scheme not in ("http", "https") or not safe_host(host) or not host_ok(host):
-            raise MediaError(0, "blocked media address")
-        r = requests.get(url, headers=headers, stream=True, allow_redirects=False, timeout=(15, timeout))
-        loc = r.headers.get("location")
-        if 300 <= r.status_code < 400 and loc:
-            r.close()
-            url = urljoin(url, loc)
-            continue
-        return r
-    raise MediaError(0, "too many redirects")
 
 
 def clean_candidates(media_url: str) -> list[str]:
@@ -763,50 +765,77 @@ def snap_thumbnail(html: str) -> str | None:
     return None
 
 
-def grab_snapchat(link: str) -> dict | None:
-    best = None
-    snap_thumb = None
-    gone = False
+def snap_link_variants(link: str) -> list[str]:
+    """The link as given, then a cleaned copy (no tracking query) / the canonical Spotlight address."""
+    p = urlparse(link)
+    out = [link]
+    if p.query or p.fragment:
+        out.append(f"https://{p.netloc}{p.path}")
+    m = re.search(r"/spotlight/([A-Za-z0-9_-]+)", p.path)
+    if m:
+        out.append(f"https://www.snapchat.com/spotlight/{m.group(1)}")
+    return list(dict.fromkeys(out))[:2]
+
+
+def snap_read_once(link: str, ua: str):
+    """One visit to the Snapchat page -> ("ok", (found, title, thumbnail)) | ("gone", None) | ("none", None)."""
+    try:
+        r = follow(link, {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}, is_snap_host, 20)
+    except (MediaError, requests.RequestException):
+        return "none", None
+    try:
+        if r.status_code in (404, 410):
+            return "gone", None
+        if not r.ok:
+            return "none", None
+        html = r.raw.read(6_000_000, decode_content=True).decode(r.encoding or "utf-8", "ignore")
+    except (requests.RequestException, OSError):
+        return "none", None
+    finally:
+        r.close()
+    found, title = extract_snap_media(html, link)
+    return ("ok", (found, title, snap_thumbnail(html))) if found else ("none", None)
+
+
+def snap_page(link: str):
     # Snapchat sometimes answers one kind of visitor with a block, a rate limit or a bare page, and the answer can
-    # differ from one minute to the next. So: try three kinds of visitor, and if none worked, wait a moment and go round again.
+    # differ from one minute to the next. So: three kinds of visitor, and if none worked wait a moment, also try the
+    # cleaned-up address, and go round again - within a time budget so a visitor never waits forever.
+    variants = snap_link_variants(link)
+    deadline = time.time() + 50
     for attempt in range(3):
         if attempt:
             time.sleep(1.5 * attempt)
-        for ua in (BROWSER_UA, MOBILE_UA, BOT_UA):
-            try:
-                r = follow(link, {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}, is_snap_host, 20)
-            except (MediaError, requests.RequestException):
-                continue
-            try:
-                if r.status_code in (404, 410):
-                    gone = True
-                    break
-                if not r.ok:
-                    continue
-                html = r.raw.read(6_000_000, decode_content=True).decode(r.encoding or "utf-8", "ignore")
-            except (requests.RequestException, OSError):
-                continue
-            finally:
-                r.close()
-            found, title = extract_snap_media(html, link)
-            if found:
-                snap_thumb = snap_thumbnail(html)
-                best = (found, title)
-                break
-        if best or gone:
-            break
-    if not best:
-        return None
+        for v in (variants[:1] if attempt == 0 else variants):
+            for ua in (BROWSER_UA, MOBILE_UA, BOT_UA):
+                if time.time() > deadline:
+                    return None
+                state, got = snap_read_once(v, ua)
+                if state == "ok":
+                    return got
+                if state == "gone":
+                    return None
+    return None
 
-    found, title = best
+
+def grab_snapchat(link: str) -> dict | None:
+    page = snap_page(link)
+    if not page:
+        return None
+    found, title, snap_thumb = page
     thumb = snap_thumb if snap_thumb and snap_thumb.startswith("https://") else None
     medias = []
     for url, kind in found[:10]:
         if kind == "image":
             medias.append({"url": url, "kind": "image", "ext": "jpg", "quality": "", "alts": []})
             continue
-        url, quality, alts = resolve_snap_video(url)
-        medias.append({"url": url, "kind": "video", "ext": "mp4", "quality": quality, "alts": alts})
+        page_url = url  # Snapchat's own copy (this is the one that may carry the watermark)
+        try:
+            url, quality, alts = resolve_snap_video(page_url)
+        except Exception as e:  # looking for the clean copy is a bonus: it must never lose the video we already have
+            print("Snapchat clean-copy check failed:", repr(e))
+            url, quality, alts = page_url, SNAP_STANDARD, []
+        medias.append({"url": url, "kind": "video", "ext": "mp4", "quality": quality, "alts": alts, "std": page_url})
     medias = [m for m in medias if is_snap_cdn((urlparse(m["url"]).hostname or "").lower())]
     return {"title": title or "snapchat", "medias": medias, "thumbnail": thumb} if medias else None
 
@@ -833,10 +862,15 @@ def media_fail_message(status: int) -> str:
     return "The file could not be fetched. Try another option, or grab the link again."
 
 
-def _save_snap(url: str, item: "Item", folder: str) -> str:
+SNAP_HEADERS = ({"User-Agent": BROWSER_UA, "Referer": "https://www.snapchat.com/", "Accept": "*/*"},
+                {"User-Agent": MOBILE_UA, "Accept": "*/*"})  # second try: look like a phone, no referrer
+SNAP_WATERMARK_NOTE = "The original copy (no watermark) wasn't available right now, so the standard copy was saved. It may show a watermark."
+
+
+def _save_snap(url: str, item: "Item", folder: str, headers: dict | None = None) -> str:
     """Save one Snapchat media address. Raises MediaError when it is refused, expired or not really a video."""
     try:
-        r = follow(url, {"User-Agent": BROWSER_UA, "Referer": "https://www.snapchat.com/", "Accept": "*/*"}, is_snap_cdn)
+        r = follow(url, headers or SNAP_HEADERS[0], is_snap_cdn)
     except requests.RequestException:
         raise MediaError(502, media_fail_message(0))
     path = os.path.join(folder, f"{item.id}.{item.ext}")
@@ -879,17 +913,28 @@ def fetch_direct(item: "Item", folder: str) -> str:
     again for fresh ones and those are tried too, so a stale look-up no longer ends in a failed download."""
     d = item.direct or {}
     urls = [d["url"]] + [u for u in d.get("alts", []) if u != d["url"]]
+    if d.get("std") and d["std"] not in urls:
+        urls.append(d["std"])  # the standard copy is always the last resort
+    item.note = None
     last: MediaError | None = None
 
     def attempt(candidates: list[str]) -> str | None:
         nonlocal last
         for u in candidates:
-            try:
-                return _save_snap(u, item, folder)
-            except MediaError as e:
-                if e.status == 413:
-                    raise
-                last = e
+            for headers in SNAP_HEADERS:
+                try:
+                    path = _save_snap(u, item, folder, headers)
+                except MediaError as e:
+                    if e.status == 413:
+                        raise
+                    last = e
+                    if e.status in (404, 410):
+                        break  # this address is gone: other headers won't bring it back
+                    continue
+                # the clean copy was promised but the page's own copy is what we got: say so
+                if d.get("quality") == SNAP_ORIGINAL and u == d.get("std") and u != d["url"]:
+                    item.note = SNAP_WATERMARK_NOTE
+                return path
         return None
 
     got = attempt(urls)
@@ -904,7 +949,8 @@ def fetch_direct(item: "Item", folder: str) -> str:
             pool = [m for m in fresh["medias"] if m["kind"] == d.get("kind")]
             same = [m for m in pool if mid and any(mid in u for u in [m["url"], *m.get("alts", [])])] or pool[:1]
             for m in same:
-                got = attempt([m["url"], *m.get("alts", [])])
+                d = {**d, "url": m["url"], "std": m.get("std") or d.get("std"), "quality": m.get("quality")}
+                got = attempt([m["url"], *m.get("alts", []), *([m["std"]] if m.get("std") else [])])
                 if got:
                     return got
     raise last or MediaError(502, media_fail_message(0))
@@ -1056,8 +1102,7 @@ def too_big() -> MediaError:
     return MediaError(413, f"That file is larger than the {MAX_MB} MB limit.")
 
 
-def _any_host(_h: str) -> bool:
-    return True  # the address itself is still checked by safe_host() inside follow()
+_any_host = any_host  # the address itself is still checked by safe_host() inside follow()
 
 
 def _fetch_whole(url: str, part: str, cap: int) -> None:
@@ -1237,6 +1282,8 @@ class Item:
     height: int | None = None        # the quality the visitor picked (None = best)
     direct: dict | None = None       # Snapchat: {"url": media address, "kind": "video" | "image"}
     yt: dict | None = None           # YouTube (RapidAPI): {"id": video id}
+    media: dict | None = None        # TikTok / Instagram / X read by social.py: {"platform", "type", "index", "post"}
+    note: str | None = None          # a plain-language remark shown after the file is ready (e.g. watermark fallback)
     info: dict | None = None         # yt-dlp's look-up result, reused by the download while it is fresh
     created: float = field(default_factory=time.time)
     touched: float = field(default_factory=time.time)
@@ -1299,13 +1346,141 @@ def clean_title(t) -> str:
     return re.sub(r"\s+", " ", s).strip()[:80].strip() or "video"
 
 
+SOCIAL = ("TikTok", "Instagram", "X")
+
+
+def post_cached(platform: str, link: str, force: bool = False):
+    """social.py's reading of a post, remembered for a few minutes (a failed reading is never remembered)."""
+    key = "post:" + link
+    if not force:
+        hit = cache_get(key)
+        if hit is not None:
+            return hit
+    post = read_post(platform, link)
+    if post:
+        cache_put(key, post)
+    return post
+
+
+def save_post_item(post: dict, m: dict, item: Item, folder: str) -> str:
+    cap = MAX_MB * 1024 * 1024
+    base = os.path.join(folder, item.id)
+    kind, ix = m["type"], m["index"]
+    gone = MediaError(422, "That part of the post is no longer available. Grab the link again.")
+    if kind == "image":
+        if ix >= len(post["images"]):
+            raise gone
+        return save_media(post["images"][ix]["urls"], base, post, "image", cap)
+    if kind == "zip":
+        if not post["images"]:
+            raise gone
+        out = base + ".zip"
+        saved = save_zip(post, folder, out, cap)
+        if saved < len(post["images"]):
+            item.note = f"{saved} of {len(post['images'])} photos could be saved; the others were not available."
+        return out
+    if kind == "video":
+        if ix >= len(post["videos"]):
+            raise gone
+        path = save_media(post["videos"][ix]["urls"], base, post, "video", cap)
+        audio = audio_streams(path)
+        if audio and not (set(audio) & SAFE_AUDIO):
+            fix_audio_codec(path)
+        return path
+    # audio: from the video when there is one, otherwise the post's own sound (photo posts)
+    src_urls = post["videos"][0]["urls"] if post["videos"] else (post.get("audio") or {}).get("urls") or []
+    if not src_urls:
+        raise MediaError(422, "This post has no sound to save.")
+    src = save_media(src_urls, os.path.join(folder, "audio-src"), post, "video", cap)
+    out = base + ".mp3"
+    run_ffmpeg(["-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", out])
+    os.remove(src)
+    return out
+
+
+def fetch_media(item: Item, folder: str, allow_ytdlp: bool = True) -> str:
+    """Save one TikTok / Instagram / X item. Layers: the addresses read at grab time -> the post read again (fresh
+    addresses and cookies) -> yt-dlp on the original link (video and audio only)."""
+    m = item.media
+    item.note = None
+    last: Exception | None = None
+    try:
+        return save_post_item(m["post"], m, item, folder)
+    except MediaError as e:
+        if e.status == 413:
+            raise
+        last = e
+    clear_folder(folder)
+    fresh = post_cached(m["platform"], item.source, force=True)
+    if fresh:
+        m["post"] = fresh
+        try:
+            return save_post_item(fresh, m, item, folder)
+        except MediaError as e:
+            if e.status == 413:
+                raise
+            last = e
+    if allow_ytdlp and m["type"] in ("video", "audio"):
+        clear_folder(folder)
+        try:
+            return fetch(item.source, folder, m["type"], None, None)
+        except Exception as e:
+            print("yt-dlp last layer failed:", repr(e))
+    raise last
+
+
+def rescue(item: Item, folder: str) -> str | None:
+    """A yt-dlp download failed: try the other ways of reading the same post before giving up."""
+    platform = platform_of(item.source)
+    try:
+        clear_folder(folder)
+        if platform == "Snapchat":
+            snap = grab_snapchat(item.source)
+            video = next((x for x in (snap or {}).get("medias", []) if x["kind"] == "video"), None)
+            if not video:
+                return None
+            item.direct = {"url": video["url"], "kind": "video", "alts": video.get("alts", []), "std": video.get("std"), "quality": video.get("quality")}
+            if item.mode != "audio":
+                return fetch_direct(item, folder)
+            want, item.ext = item.ext, "mp4"  # save the video first, then take the sound out of it
+            try:
+                src = fetch_direct(item, folder)
+            finally:
+                item.ext = want
+            out = os.path.join(folder, f"{item.id}.mp3")
+            run_ffmpeg(["-i", src, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", out])
+            os.remove(src)
+            return out
+        if platform in SOCIAL and item.mode in ("video", "audio"):
+            post = post_cached(platform, item.source, force=True)
+            if not post:
+                return None
+            item.media = {"platform": platform, "type": item.mode, "index": 0, "post": post}
+            return fetch_media(item, folder, allow_ytdlp=False)
+    except Exception as e:
+        print("Rescue layer failed:", repr(e))
+        if isinstance(e, MediaError) and e.status == 413:
+            raise
+    return None
+
+
 def build(item: Item, folder: str) -> str:
     if item.yt:
         return fetch_youtube(item, folder)
     if item.direct:
         return fetch_direct(item, folder)
+    if item.media:
+        return fetch_media(item, folder)
     fresh = item.info if time.time() - item.created < INFO_TTL else None
-    return fetch(item.source, folder, item.mode, item.height, fresh)
+    try:
+        return fetch(item.source, folder, item.mode, item.height, fresh)
+    except Exception as first:
+        if re.search(r"larger than|max-filesize|too large", str(first), re.I):
+            raise  # a size problem: another route would hit the same limit
+        got = rescue(item, folder)
+        if got:
+            return got
+        raise
 
 
 def why(e: Exception) -> str:
@@ -1417,13 +1592,41 @@ def options_from_snap(link: str, snap: dict) -> list[dict]:
     picked = videos or [m for m in snap["medias"] if m["kind"] == "image"][:4]
     out = []
     for i, m in enumerate(picked, 1):
-        item = register(source=link, mode="video", title=title, ext=m["ext"], direct={"url": m["url"], "kind": m["kind"], "alts": m.get("alts", [])})
+        item = register(source=link, mode="video", title=title, ext=m["ext"],
+                        direct={"url": m["url"], "kind": m["kind"], "alts": m.get("alts", []), "std": m.get("std"), "quality": m.get("quality")})
         if m["kind"] == "image":
             label = "Image"
         else:
             label = "Video" + (f" {i}" if len(videos) > 1 else "") + (f" · {m['quality']}" if m["quality"] else "")
         out.append({**option(item, label), "kind": m["kind"]})
     return out
+
+
+def options_from_post(link: str, platform: str, post: dict) -> list[dict]:
+    """Videos, pictures (one ZIP for the whole carousel + the first few as single files) and the sound of a post."""
+    title = clean_title(post["title"])
+    out = []
+
+    def add(mode: str, ext: str, label: str, kind: str, mtype: str, ix: int) -> None:
+        it = register(source=link, mode=mode, title=title, ext=ext, media={"platform": platform, "type": mtype, "index": ix, "post": post})
+        out.append({**option(it, label), "kind": kind})
+
+    videos, images = post["videos"][:4], post["images"]
+    for i in range(len(videos)):
+        add("video", "mp4", "Video" + (f" {i + 1}" if len(videos) > 1 else ""), "video", "video", i)
+    if len(images) > 1:
+        add("image", "zip", f"All {len(images)} photos", "image", "zip", 0)
+    for i in range(min(len(images), 6)):
+        add("image", "jpg", "Photo" if len(images) == 1 else f"Photo {i + 1}", "image", "image", i)
+    if post["videos"] or post.get("audio"):
+        add("audio", "mp3", "Audio", "audio", "audio", 0)
+    return out
+
+
+def post_response(link: str, platform: str, post: dict) -> dict:
+    opts = options_from_post(link, platform, post)
+    return {"title": clean_title(post["title"]), "platform": platform, "thumbnail": post.get("thumbnail"),
+            "duration": post.get("duration"), "options": opts, "preview": pick_preview(opts, first=True)}
 
 
 @app.get("/health")
@@ -1477,12 +1680,29 @@ async def grab(req: Req, request: Request):
                 opts = options_from_snap(url, snap)
                 return {"title": clean_title(snap["title"]), "platform": platform, "thumbnail": snap.get("thumbnail"), "duration": None,
                         "options": opts, "preview": pick_preview(opts, first=True)}
+        # TikTok: our own page reader first (yt-dlp is the one that fails most often there, and it can't read photo
+        # posts). Instagram / X: yt-dlp first, and when it can't read the post (photo posts, blocked, changed page)
+        # social.py reads it instead, so a picture post is offered as pictures rather than shown as an error.
+        if platform == "TikTok":
+            post = await asyncio.to_thread(post_cached, platform, url)
+            if post:
+                return post_response(url, platform, post)
+        entry, lookup_err = None, None
         try:
             entry = await asyncio.to_thread(lookup, url)
         except Exception as e:
+            lookup_err = e
+        if platform in ("Instagram", "X") and not (entry and has_media(entry) and not entry.get("fallback")):
+            post = await asyncio.to_thread(post_cached, platform, url)
+            if post:
+                return post_response(url, platform, post)
+        if entry is None:
             if platform == "Snapchat":
                 raise HTTPException(422, SNAP_FAIL)
-            raise HTTPException(422, f"Couldn't read that video: {why(e)}")
+            if platform in SOCIAL:
+                raise HTTPException(422, f"Couldn't read that {platform} post right now. It may be private or removed, or {platform} is blocking requests. "
+                                         f"Try again in a moment. ({why(lookup_err)[:120]})")
+            raise HTTPException(422, f"Couldn't read that video: {why(lookup_err)}")
 
     thumb = entry.get("thumbnail")
     duration = entry.get("duration")
@@ -1507,7 +1727,7 @@ async def download(item_id: str, request: Request, probe: int = 0, inline: int =
         check_rate(client_ip(request))  # only work that has to be done counts against the limit
     path = await prepare(item)
     if probe:
-        return {"ok": True}
+        return {"ok": True, **({"note": item.note} if item.note else {})}
     ext = os.path.splitext(path)[1].lower()
     return FileResponse(path, media_type=MEDIA_MIME.get(ext, "application/octet-stream"),
                         filename=f"{item.title}{ext}",

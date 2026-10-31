@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SnapIT — Video downloads, made simple</title>
-  <meta name="description" content="Paste a YouTube, Pinterest, Snapchat, TikTok, X or Instagram link and grab the video or audio.">
+  <meta name="description" content="Paste a YouTube, Pinterest, Snapchat, TikTok, X or Instagram link and grab the video, photos or audio.">
   <meta property="og:title" content="SnapIT — Video downloads, made simple">
   <meta property="og:description" content="A little link. A moment worth keeping. Video and audio downloads with SnapIT.">
   <meta property="og:type" content="website">
@@ -19,7 +19,7 @@
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap">
-  <link rel="stylesheet" href="style.css?v=7">
+  <link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
 <div class="snap-page">
@@ -33,6 +33,7 @@
       <span class="brand-symbol" id="brand-symbol"></span>SnapIT<span class="brand-dot">.</span>
     </a>
     <div class="header-right">
+      <button type="button" class="install-btn" id="ext-btn" hidden>Get extension</button>
       <button type="button" class="install-btn" id="install-btn" hidden>Install app</button>
       <button type="button" class="theme-switch" id="theme-switch" role="switch" aria-checked="false" aria-label="Dark mode" title="Switch to dark mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l2 2m10 10 2 2M5 19l2-2M17 7l2-2"/></svg><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 15A9 9 0 0 1 9 4a9 9 0 1 0 11 11Z"/></svg><span class="switch-thumb"></span></button>
     </div>
@@ -82,7 +83,28 @@
       <button type="button" class="grab-button" id="modal-done">Got it <span class="btn-icon" id="modal-check"></span></button>
     </section>
   </div>
+
+  <div class="modal-backdrop" id="ext-modal" hidden>
+    <section class="info-modal ext-modal" role="dialog" aria-modal="true" aria-labelledby="ext-title">
+      <button type="button" class="icon-button modal-close" id="ext-close" aria-label="Close dialog"></button>
+      <i class="modal-spark" id="ext-spark"></i>
+      <h2 id="ext-title">SnapIT for your browser</h2>
+      <p>Grab videos from any page with one click. Works in Chrome, Edge, Brave and Opera on a computer.</p>
+      <a class="grab-button" id="ext-store" href="#" target="_blank" rel="noopener" hidden>Add to browser</a>
+      <div id="ext-manual">
+        <a class="grab-button" href="extension/snapit-extension.zip" download>Download extension</a>
+        <ol class="ext-steps">
+          <li>Unzip the downloaded file.</li>
+          <li>Open <code>chrome://extensions</code> (Edge: <code>edge://extensions</code>) and turn on <b>Developer mode</b>.</li>
+          <li>Click <b>Load unpacked</b> and choose the unzipped folder.</li>
+          <li>Open the SnapIT icon and paste this address, then press <b>Save</b> and <b>Allow</b>:
+            <span class="ext-address"><code id="ext-address"></code><button type="button" class="glass-button" id="ext-copy">Copy</button></span>
+          </li>
+        </ol>
+      </div>
+    </section>
+  </div>
 </div>
-  <script src="script.js?v=7" defer></script>
+  <script src="script.js?v=9" defer></script>
 </body>
 </html>

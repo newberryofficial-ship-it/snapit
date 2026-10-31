@@ -2,14 +2,14 @@
    - Caches the app shell so SnapIT opens instantly and shows a friendly page when offline.
    - NEVER touches /api/* (look-ups, downloads, health pings) - those always go straight to the network.
    Bump VERSION whenever you change any cached file, so installed copies pick up the update. */
-const VERSION = 'snapit-v1';
+const VERSION = 'snapit-v3';
 const SHELL = `${VERSION}-shell`;
 const RUNTIME = `${VERSION}-runtime`;
 
 const SHELL_FILES = [
   '/',
-  '/style.css?v=7',
-  '/script.js?v=7',
+  '/style.css?v=9',
+  '/script.js?v=9',
   '/favicon.svg',
   '/flow-background.jpg',
   '/manifest.webmanifest',
@@ -37,8 +37,8 @@ self.addEventListener('fetch', event => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
 
-  // Downloads, look-ups and health pings: always live, never cached.
-  if (url.origin === self.location.origin && url.pathname.startsWith('/api/')) return;
+  // Downloads, look-ups and health pings: always live, never cached. Same for the extension zip.
+  if (url.origin === self.location.origin && (url.pathname.startsWith('/api/') || url.pathname.startsWith('/extension/'))) return;
 
   // Pages: network first, then the cached page, then the offline page.
   if (req.mode === 'navigate') {

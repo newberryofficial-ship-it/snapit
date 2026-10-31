@@ -6,6 +6,8 @@ SnapIT keeps its original page and design, now built the way Toolora is: a stati
 ```
 backend/Dockerfile        Render image: Python 3.12, ffmpeg, yt-dlp, FastAPI
 backend/main.py           the FastAPI service
+backend/social.py         reads TikTok / Instagram / X posts (pictures + backup reader) and saves their media
+backend/test_social.py    offline tests for social.py (pytest)
 backend/requirements.txt
 public/                   the SnapIT page (index.html, style.css, script.js, favicon.svg, flow-background.jpg, robots.txt)
 src/index.js              Cloudflare Worker: serves public/ and forwards /api/* to the backend
@@ -87,5 +89,27 @@ SnapIT is now an installable Progressive Web App. New files in `public/`: `manif
 - **Installing:** Chrome/Edge/Android show an "Install app" button in the header; on iPhone use Share > Add to Home Screen.
 - **Offline:** the page shell is cached so the app opens instantly; with no connection it shows a friendly offline message. Grabbing and downloading always need the internet, and `/api/*` is never cached by the service worker.
 - **Share target:** on Android/desktop Chrome, sharing a link to SnapIT pre-fills the link box.
-- **Updating:** when you change `style.css`, `script.js` or other cached files, bump `VERSION` in `sw.js` (and the `?v=7` in `index.html` + `SHELL_FILES` if you change those) so installed copies refresh.
+- **Updating:** when you change `style.css`, `script.js` or other cached files, bump `VERSION` in `sw.js` (and the `?v=9` in `index.html` + `SHELL_FILES` if you change those) so installed copies refresh.
 - Needs HTTPS (the Cloudflare Worker domain already is). `_headers` makes `sw.js` revalidate on every load.
+
+## Browser extension on the site
+A **Get extension** button appears in the header (desktop Chrome/Edge/Brave/Opera only). It opens a dialog with the download (`public/extension/snapit-extension.zip`), install steps and this site's address with a Copy button. The extension's source and README are inside that zip.
+- When you publish the extension to the Chrome Web Store / Edge Add-ons, set `EXTENSION_STORE_URL` near the end of `public/script.js`; the dialog then shows a one-click **Add to browser** button.
+- If you change the extension, replace the zip with a new build and bump its `version` in `manifest.json`.
+
+## v3.5 - pictures, Snapchat fallback, extra reliability layers
+**Pictures.** TikTok photo posts, Instagram picture/carousel posts and X posts with photos are now offered instead of an error: one **ZIP** with every photo, the first six photos as single **JPG** files, and **Audio** (the post's sound) where there is one. Videos in the same post are listed too. Reading is done by `backend/social.py`.
+
+**Layers (each one only runs if the one before it failed)**
+| Site | Reading the post | Saving a video / audio |
+|---|---|---|
+| TikTok | own page reader (browser, then phone) -> TikTok embed page -> yt-dlp (now impersonating Chrome through `curl_cffi`) | addresses from the first reading -> post read again (fresh addresses + cookies) -> yt-dlp |
+| Instagram | yt-dlp -> embed page JSON (carousels) -> embed picture -> link-preview picture | yt-dlp -> post read through social.py |
+| X | yt-dlp -> X's embed endpoint -> `X_FALLBACK_API` (default api.fxtwitter.com; set empty to switch off) | yt-dlp -> post read through social.py |
+| Snapchat | page as browser / phone / link-preview bot, 3 rounds, also the cleaned-up address (50 s budget) -> yt-dlp | original (no watermark) -> backup clean addresses -> Snapchat's own copy (may show a watermark) -> page read again for fresh addresses -> yt-dlp |
+
+**Snapchat watermark fallback.** If the clean copy can't be fetched the standard copy is saved instead of failing, and the page tells the visitor ("...the standard copy was saved. It may show a watermark."). If checking for the clean copy itself crashes, the video is still offered.
+
+**New env vars (optional):** `X_FALLBACK_API`, `YTDLP_IMPERSONATE` (default `chrome`, empty = off). `requirements.txt` now installs `yt-dlp[default,curl-cffi]`; redeploy the backend with **Clear build cache & deploy**, and make sure the Dockerfile copies `social.py` (it does).
+
+**Limits to know about.** TikTok, Instagram and X change their pages and block data-centre addresses from time to time; the layers make failures much rarer but cannot make them impossible. Private posts are never reachable. Instagram sometimes shows only the first picture of a carousel to visitors who aren't logged in. Run the offline tests with `cd backend && pip install pytest && pytest -q`.

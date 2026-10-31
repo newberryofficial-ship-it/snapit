@@ -54,6 +54,7 @@ const LOGOS = {
 
 const STROKE = 'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
 const ICONS = {
+  image: `<svg viewBox="0 0 24 24" ${STROKE}><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>`,
   download: `<svg viewBox="0 0 24 24" ${STROKE}><path d="M12 17V3"/><path d="m6 11 6 6 6-6"/><path d="M19 21H5"/></svg>`,
   close: `<svg viewBox="0 0 24 24" ${STROKE}><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
   shield: `<svg viewBox="0 0 24 24" ${STROKE}><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>`,
@@ -169,6 +170,7 @@ async function startDownload(btn, note, o) {
   btn.classList.add('is-busy');
   btn.innerHTML = `<span class="spinner">${ICONS.loader}</span> Preparing`;
   note.hidden = true;
+  note.classList.remove('is-info');
   const href = API_BASE + o.url;
   try {
     const res = await fetch(href + '?probe=1');
@@ -176,6 +178,8 @@ async function startDownload(btn, note, o) {
     try { data = await res.json(); } catch {}
     if (!res.ok || data.error) throw new Error(data.error || 'The file could not be fetched. Try another option, or grab the link again.');
     triggerDownload(href + '?t=' + Date.now());
+    /* A plain-language remark from the server, e.g. "the standard copy was saved, it may show a watermark". */
+    if (typeof data.note === 'string' && data.note) { note.textContent = data.note; note.classList.add('is-info'); note.hidden = false; }
     btn.classList.remove('is-busy');
     btn.classList.add('is-done');
     btn.innerHTML = `Started ${ICONS.check}`;
@@ -183,6 +187,7 @@ async function startDownload(btn, note, o) {
   } catch (e) {
     btn.classList.remove('is-busy');
     btn.innerHTML = DOWNLOAD_LABEL;
+    note.classList.remove('is-info');
     note.textContent = e instanceof TypeError ? 'Could not reach the SnapIT server. Check your connection and try again.' : e.message;
     note.hidden = false;
   } finally {
@@ -308,7 +313,7 @@ function showResults(options, info) {
     row.style.animationDelay = (i * 0.07) + 's';
     const audio = String(o.format).toUpperCase() === 'MP3';
     row.innerHTML =
-      `<div class="format-icon">${audio ? ICONS.headphones : ICONS.download}</div>` +
+      `<div class="format-icon">${audio ? ICONS.headphones : o.kind === 'image' ? ICONS.image : ICONS.download}</div>` +
       `<div class="download-detail"><strong>${esc(o.label)} <span>${esc(o.format)}</span></strong><small title="${esc(o.filename)}">${esc(o.filename)}</small></div>`;
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -481,4 +486,37 @@ window.addEventListener('appinstalled', () => { installEvent = null; installBtn.
  if (!shared) return;
  updateUrl(shared[0]);
  history.replaceState(null, '', location.pathname);
+})();
+
+
+/* ============ Browser extension: "Get extension" button + install dialog ============ */
+/* When SnapIT is published in the Chrome Web Store / Edge Add-ons, paste its address here. The dialog then
+   shows a one-click "Add to browser" button above the manual steps. */
+const EXTENSION_STORE_URL = '';
+
+(() => {
+ const btn = document.getElementById('ext-btn');
+ const box = document.getElementById('ext-modal');
+ const isDesktop = !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) && !matchMedia('(pointer: coarse)').matches;
+ const isChromium = /Chrome|Chromium|Edg\//.test(navigator.userAgent);
+ if (!btn || !box || !isDesktop || !isChromium) return; // the extension only works in desktop Chromium browsers
+ btn.hidden = false;
+ document.getElementById('ext-spark').innerHTML = ICONS.sparkles;
+ document.getElementById('ext-close').innerHTML = ICONS.close;
+ const address = document.getElementById('ext-address');
+ address.textContent = location.origin;
+ const store = document.getElementById('ext-store');
+ if (EXTENSION_STORE_URL) { store.href = EXTENSION_STORE_URL; store.hidden = false; }
+ const open = () => { box.hidden = false; };
+ const close = () => { box.hidden = true; };
+ btn.addEventListener('click', open);
+ document.getElementById('ext-close').addEventListener('click', close);
+ box.addEventListener('click', e => { if (e.target === box) close(); });
+ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !box.hidden) close(); });
+ const copy = document.getElementById('ext-copy');
+ copy.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(location.origin); copy.textContent = 'Copied'; }
+  catch { const r = document.createRange(); r.selectNodeContents(address); const s = getSelection(); s.removeAllRanges(); s.addRange(r); copy.textContent = 'Select + copy'; }
+  setTimeout(() => { copy.textContent = 'Copy'; }, 2000);
+ });
 })();

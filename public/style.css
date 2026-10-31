@@ -353,3 +353,18 @@ a { color: inherit; }
 .install-btn:hover { background: var(--glass-highlight); transform: translateY(-1px); }
 .install-btn[hidden] { display: none; }
 .header-right { display: flex; align-items: center; gap: 10px; }
+
+/* Browser extension dialog */
+a.grab-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; text-decoration: none; }
+.ext-modal { max-height: 90vh; overflow-y: auto; }
+.ext-modal .grab-button { margin: 4px 0 14px; }
+.ext-steps { margin: 0; padding-left: 20px; display: grid; gap: 8px; font-size: 14px; line-height: 1.5; text-align: left; }
+.ext-steps code, .ext-address code { background: var(--accent); padding: 1px 6px; border-radius: 5px; font-size: 13px; word-break: break-all; }
+.ext-address { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.ext-address .glass-button { padding: 5px 12px; font-size: 13px; }
+a.grab-button[hidden] { display: none; }
+.ext-steps code { white-space: nowrap; word-break: normal; }
+.ext-address code { white-space: normal; word-break: break-all; }
+
+/* A remark from the server shown under a finished download (not an error) */
+.row-error.is-info { color: var(--muted-foreground); }
